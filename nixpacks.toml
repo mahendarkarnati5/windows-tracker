@@ -1,0 +1,22 @@
+[phases.setup]
+nixPkgs = ["jdk21", "maven"]
+
+[phases.install]
+cmds = [
+    "export JAVA_HOME=$(readlink -f /nix/store/*openjdk-21*/)",
+    "export PATH=$JAVA_HOME/bin:$PATH",
+    "java -version",
+    "mvn clean package -DskipTests"
+]
+
+[phases.start]
+cmd = "java -Dserver.port=$PORT $JAVA_OPTS -jar target/*.jar"
+
+[build.env]
+JAVA_HOME = "/nix/store/*openjdk-21*/"
+TIDB_URL = "$TIDB_URL"
+TIDB_USER = "$TIDB_USER"
+TIDB_PASSWORD = "$TIDB_PASSWORD"
+JWT_SECRET = "$JWT_SECRET"
+JWT_EXPIRE = "$JWT_EXPIRE"
+PORT = "$PORT"
