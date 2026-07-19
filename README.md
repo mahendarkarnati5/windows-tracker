@@ -78,7 +78,3 @@ Tests use H2 in MySQL mode and real Flyway migrations. They cover replay/out-of-
 7. Monitor `agent_activities`, rejected client rows, and outbox depth before broad rollout.
 
 Never edit an already-applied Flyway migration. Add a new versioned migration for later schema changes.
-"# windows-tracker" 
-"# windows-tracker" 
-"# windows-tracker" 
-"# windows-tracker" 
