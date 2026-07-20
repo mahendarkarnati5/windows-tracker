@@ -78,3 +78,17 @@ Tests use H2 in MySQL mode and real Flyway migrations. They cover replay/out-of-
 7. Monitor `agent_activities`, rejected client rows, and outbox depth before broad rollout.
 
 Never edit an already-applied Flyway migration. Add a new versioned migration for later schema changes.
+
+## Built-in admin dashboard
+
+The server now serves a dependency-free admin dashboard from `/` on the same port as the API. The login screen uses `POST /api/auth/admin`; every dashboard data request remains protected by `ROLE_ADMIN`.
+
+Dashboard flow:
+
+1. Sign in as an admin and view total, online, offline, and shutdown device cards.
+2. Click a card to open the corresponding device table.
+3. Open Users, select a user, then select one of that user's devices.
+4. The dedicated device view shows today's process count, running processes, the latest session, current idle state, and current active window.
+5. Full information provides Processes, Active windows, Idle periods, and Sessions tabs with server-side pagination, partial text matching after two characters, date/status/time filters, sortable columns, and filtered-duration totals.
+
+The default activity view is Today in descending order. Filtered duration is deliberately not calculated or displayed until the admin applies a filter, which avoids an unnecessary aggregate query on initial page load.
