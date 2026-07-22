@@ -43,4 +43,10 @@ public interface IdleActivityRepository
             @Param("status") String status,
             @Param("fromTime") LocalDateTime fromTime,
             @Param("toTime") LocalDateTime toTime);
+    @Query("""
+           select distinct i.device.id from IdleActivity i
+           where i.device is not null and upper(i.status) = 'RUNNING'
+           """)
+    List<Long> findDeviceIdsWithRunningRows();
+
 }

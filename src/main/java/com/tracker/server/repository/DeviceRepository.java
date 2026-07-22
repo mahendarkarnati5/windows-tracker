@@ -21,6 +21,7 @@ public interface DeviceRepository
 	            Long userId);
 
 	 List<Device> findByStatus(String status);
+     List<Device> findByOnlineTrueAndLastSeenBefore(LocalDateTime cutoff);
 	 
 	 @Modifying
 	 @Transactional

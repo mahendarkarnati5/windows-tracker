@@ -55,4 +55,10 @@ public interface ActiveWindowActivityRepository
             @Param("search") String search,
             @Param("fromTime") LocalDateTime fromTime,
             @Param("toTime") LocalDateTime toTime);
+    @Query("""
+           select distinct a.device.id from ActiveWindowActivity a
+           where a.device is not null and upper(a.status) = 'RUNNING'
+           """)
+    List<Long> findDeviceIdsWithRunningRows();
+
 }

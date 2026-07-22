@@ -51,7 +51,6 @@ import jakarta.persistence.criteria.Predicate;
 @Transactional(readOnly = true)
 public class AdminDashboardService {
 
-    private static final Set<String> CLOSED_SESSION_STATUSES = Set.of("CLOSED", "SHUTDOWN");
 
     private final UserRepository userRepository;
     private final DeviceRepository deviceRepository;
@@ -506,7 +505,7 @@ public class AdminDashboardService {
         }
         if (latestSession != null
                 && latestSession.getShutdownTime() != null
-                && CLOSED_SESSION_STATUSES.contains(safe(latestSession.getStatus()).toUpperCase(Locale.ROOT))) {
+                && "SHUTDOWN".equals(safe(latestSession.getStatus()).toUpperCase(Locale.ROOT))) {
             return "SHUTDOWN";
         }
         return "OFFLINE";

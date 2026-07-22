@@ -16,6 +16,8 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
 
 import com.tracker.server.agent.dto.ActivitySnapshotRequest;
+import com.tracker.server.agent.dto.AgentPresenceRequest;
+import com.tracker.server.agent.dto.AgentShutdownRequest;
 import com.tracker.server.agent.dto.AgentSyncRequest;
 import com.tracker.server.agent.entity.AgentDevice;
 import com.tracker.server.agent.model.ActivityKind;
@@ -23,7 +25,9 @@ import com.tracker.server.agent.model.ActivityState;
 import com.tracker.server.agent.repository.AgentActivityRepository;
 import com.tracker.server.agent.repository.AgentDeviceRepository;
 import com.tracker.server.agent.service.AgentRecordUpsertService;
+import com.tracker.server.agent.service.AgentProjectionService;
 import com.tracker.server.agent.service.AgentCredentialService;
+import com.tracker.server.agent.service.AgentDeviceService;
 import com.tracker.server.agent.service.AgentSyncService;
 import com.tracker.server.entity.Device;
 import com.tracker.server.entity.User;
@@ -39,8 +43,10 @@ import com.tracker.server.repository.UserRepository;
 class AgentSyncIntegrationTest {
 
     @Autowired AgentRecordUpsertService upsertService;
+    @Autowired AgentProjectionService projectionService;
     @Autowired AgentCredentialService credentialService;
     @Autowired AgentSyncService syncService;
+    @Autowired AgentDeviceService deviceService;
     @Autowired AgentActivityRepository activityRepository;
     @Autowired AgentDeviceRepository agentDeviceRepository;
     @Autowired ProcessActivityRepository processRepository;
@@ -206,11 +212,249 @@ class AgentSyncIntegrationTest {
         var response = syncService.synchronize(
                 user.getUsername(),
                 agentDevice.getDeviceUuid(),
-                new AgentSyncRequest(List.of(invalid, valid)));
+                new AgentSyncRequest(
+                        UUID.randomUUID().toString(),
+                        Instant.now().minusSeconds(30),
+                        1L,
+                        Instant.now(),
+                        List.of(invalid, valid)),
+                "127.0.0.1");
 
         assertThat(response.acknowledgements())
                 .extracting(acknowledgement -> acknowledgement.status())
                 .containsExactly("REJECTED", "APPLIED");
         assertThat(activityRepository.findById(valid.recordUuid())).isPresent();
     }
+    @Test
+    void temporaryOfflineCloseIsReplacedByLaterAuthoritativeLocalClose() {
+        String recordUuid = UUID.randomUUID().toString();
+        Instant start = Instant.parse("2026-07-20T10:00:00Z");
+        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
+                recordUuid,
+                ActivityKind.PROCESS,
+                1,
+                start,
+                null,
+                ActivityState.OPEN,
+                null,
+                700L,
+                "chrome.exe",
+                null,
+                null));
+
+        LocalDateTime disconnectedAt = LocalDateTime.ofInstant(
+                Instant.parse("2026-07-20T11:00:00Z"), ZoneOffset.UTC);
+        projectionService.temporarilyCloseForOffline(agentDevice, disconnectedAt);
+
+        var temporary = processRepository.findAll().getFirst();
+        assertThat(temporary.getStatus()).isEqualTo("OFFLINE");
+        assertThat(temporary.getEndTime()).isEqualTo(disconnectedAt);
+        assertThat(temporary.getDurationSeconds()).isEqualTo(3_600L);
+        assertThat(activityRepository.findById(recordUuid).orElseThrow().getState())
+                .isEqualTo(ActivityState.OPEN);
+
+        Instant actualClose = Instant.parse("2026-07-20T11:30:00Z");
+        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
+                recordUuid,
+                ActivityKind.PROCESS,
+                2,
+                start,
+                actualClose,
+                ActivityState.CLOSED,
+                "PROCESS_EXIT",
+                700L,
+                "chrome.exe",
+                null,
+                null));
+
+        var corrected = processRepository.findAll().getFirst();
+        assertThat(corrected.getStatus()).isEqualTo("CLOSED");
+        assertThat(corrected.getEndTime())
+                .isEqualTo(LocalDateTime.ofInstant(actualClose, ZoneOffset.UTC));
+        assertThat(corrected.getDurationSeconds()).isEqualTo(5_400L);
+    }
+
+    @Test
+    void reconnectPresenceRestoresOnlyRecordsStillOpenOnTheAgent() {
+        String recordUuid = UUID.randomUUID().toString();
+        Instant start = Instant.parse("2026-07-20T12:00:00Z");
+        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
+                recordUuid,
+                ActivityKind.ACTIVE_WINDOW,
+                1,
+                start,
+                null,
+                ActivityState.OPEN,
+                null,
+                701L,
+                "chrome.exe",
+                "Dashboard",
+                null));
+        projectionService.temporarilyCloseForOffline(
+                agentDevice,
+                LocalDateTime.ofInstant(start.plusSeconds(60), ZoneOffset.UTC));
+
+        projectionService.reconcileOpenRecords(agentDevice, java.util.Set.of(recordUuid));
+
+        var restored = windowRepository.findAll().getFirst();
+        assertThat(restored.getStatus()).isEqualTo("RUNNING");
+        assertThat(restored.getEndTime()).isNull();
+        assertThat(restored.getDurationSeconds()).isNull();
+    }
+
+    @Test
+    void deviceSessionUsesShutdownStatusOnlyForARealSystemShutdown() {
+        Instant start = Instant.parse("2026-07-20T13:00:00Z");
+        String shutdownSession = UUID.randomUUID().toString();
+        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
+                shutdownSession,
+                ActivityKind.DEVICE_SESSION,
+                1,
+                start,
+                start.plusSeconds(60),
+                ActivityState.CLOSED,
+                "SYSTEM_SHUTDOWN",
+                null,
+                null,
+                null,
+                null));
+
+        assertThat(sessionRepository.findAll().getFirst().getStatus()).isEqualTo("SHUTDOWN");
+    }
+
+    @Test
+    void lifecycleOrderingRejectsLateRequestsFromAnOldSession() {
+        String oldSession = UUID.randomUUID().toString();
+        Instant oldStart = Instant.now().minusSeconds(3_600);
+        Instant oldShutdown = Instant.now().minusSeconds(1_800);
+
+        deviceService.activitySeen(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                oldSession,
+                oldStart,
+                1L,
+                oldStart.plusSeconds(30),
+                "127.0.0.1");
+        deviceService.shutdown(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                new AgentShutdownRequest(
+                        oldShutdown, oldSession, oldStart, 1L, "SYSTEM_SHUTDOWN"),
+                "127.0.0.1");
+
+        // A delayed heartbeat from the already shut-down session cannot resurrect it.
+        deviceService.heartbeat(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                new AgentPresenceRequest(
+                        oldShutdown.plusSeconds(1), oldSession, oldStart, 1L, List.of()),
+                "127.0.0.1");
+        var afterLateHeartbeat = agentDeviceRepository.findById(agentDevice.getId()).orElseThrow();
+        assertThat(afterLateHeartbeat.getLifecycleState()).isEqualTo("SHUTDOWN");
+        assertThat(deviceRepository.findById(agentDevice.getLegacyDeviceId()).orElseThrow().isOnline())
+                .isFalse();
+
+        String newSession = UUID.randomUUID().toString();
+        Instant newStart = Instant.now();
+        deviceService.heartbeat(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                new AgentPresenceRequest(newStart, newSession, newStart, 2L, List.of()),
+                "127.0.0.1");
+
+        // A late shutdown from the older session cannot close the new boot.
+        deviceService.shutdown(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                new AgentShutdownRequest(
+                        oldShutdown.plusSeconds(10),
+                        oldSession,
+                        oldStart,
+                        1L,
+                        "SYSTEM_SHUTDOWN"),
+                "127.0.0.1");
+
+        var current = agentDeviceRepository.findById(agentDevice.getId()).orElseThrow();
+        assertThat(current.getCurrentSessionUuid()).isEqualTo(newSession);
+        assertThat(current.getLifecycleState()).isEqualTo("ONLINE");
+        assertThat(deviceRepository.findById(agentDevice.getLegacyDeviceId()).orElseThrow().isOnline())
+                .isTrue();
+    }
+
+    @Test
+    void serverTruncatesLongWindowTitlesBeforePersistence() {
+        String recordUuid = UUID.randomUUID().toString();
+        Instant start = Instant.parse("2026-07-22T08:00:00Z");
+        String longTitle = "😀".repeat(1_100);
+
+        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
+                recordUuid,
+                ActivityKind.ACTIVE_WINDOW,
+                1,
+                start,
+                null,
+                ActivityState.OPEN,
+                null,
+                800L,
+                "chrome.exe",
+                longTitle,
+                null));
+
+        var canonical = activityRepository.findById(recordUuid).orElseThrow();
+        assertThat(canonical.getWindowTitle().codePointCount(
+                0, canonical.getWindowTitle().length())).isEqualTo(1_000);
+        var projection = windowRepository.findAll().getFirst();
+        assertThat(projection.getWindowTitle().codePointCount(
+                0, projection.getWindowTitle().length())).isEqualTo(1_000);
+    }
+
+    @Test
+    void heartbeatOlderThanActivityStartDoesNotCreateNegativeDuration() {
+        String recordUuid = UUID.randomUUID().toString();
+        Instant start = Instant.parse("2026-07-22T10:00:30Z");
+        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
+                recordUuid,
+                ActivityKind.ACTIVE_WINDOW,
+                1,
+                start,
+                null,
+                ActivityState.OPEN,
+                null,
+                801L,
+                "chrome.exe",
+                "Latest window",
+                null));
+
+        projectionService.temporarilyCloseForOffline(
+                agentDevice,
+                LocalDateTime.ofInstant(
+                        Instant.parse("2026-07-22T10:00:00Z"), ZoneOffset.UTC));
+
+        var temporary = windowRepository.findAll().getFirst();
+        assertThat(temporary.getStatus()).isEqualTo("OFFLINE");
+        assertThat(temporary.getEndTime()).isNull();
+        assertThat(temporary.getDurationSeconds()).isNull();
+
+        Instant actualEnd = Instant.parse("2026-07-22T10:01:00Z");
+        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
+                recordUuid,
+                ActivityKind.ACTIVE_WINDOW,
+                2,
+                start,
+                actualEnd,
+                ActivityState.CLOSED,
+                "WINDOW_CHANGED",
+                801L,
+                "chrome.exe",
+                "Latest window",
+                null));
+
+        var corrected = windowRepository.findAll().getFirst();
+        assertThat(corrected.getStatus()).isEqualTo("CLOSED");
+        assertThat(corrected.getEndTime())
+                .isEqualTo(LocalDateTime.ofInstant(actualEnd, ZoneOffset.UTC));
+        assertThat(corrected.getDurationSeconds()).isEqualTo(30L);
+    }
+
 }

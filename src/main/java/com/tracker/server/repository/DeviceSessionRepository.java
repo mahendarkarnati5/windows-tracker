@@ -55,4 +55,10 @@ public interface DeviceSessionRepository
             @Param("status") String status,
             @Param("fromTime") LocalDateTime fromTime,
             @Param("toTime") LocalDateTime toTime);
+    @Query("""
+           select distinct s.device.id from DeviceSession s
+           where s.device is not null and upper(s.status) = 'RUNNING'
+           """)
+    List<Long> findDeviceIdsWithRunningRows();
+
 }

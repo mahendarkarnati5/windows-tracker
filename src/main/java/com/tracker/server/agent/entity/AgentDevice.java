@@ -42,6 +42,21 @@ public class AgentDevice {
     private String lastIpAddress;
     private LocalDateTime lastSeenAt;
 
+    @Column(name = "current_session_uuid", length = 36)
+    private String currentSessionUuid;
+
+    @Column(name = "current_session_started_at")
+    private LocalDateTime currentSessionStartedAt;
+
+    @Column(name = "current_session_sequence")
+    private Long currentSessionSequence;
+
+    @Column(name = "lifecycle_state", length = 32)
+    private String lifecycleState;
+
+    @Column(name = "last_lifecycle_at")
+    private LocalDateTime lastLifecycleAt;
+
     @Column(name = "credential_hash", length = 64)
     private String credentialHash;
 

@@ -78,4 +78,10 @@ public interface ProcessActivityRepository
             @Param("search") String search,
             @Param("fromTime") LocalDateTime fromTime,
             @Param("toTime") LocalDateTime toTime);
+    @Query("""
+           select distinct p.device.id from ProcessActivity p
+           where p.device is not null and upper(p.status) = 'RUNNING'
+           """)
+    List<Long> findDeviceIdsWithRunningRows();
+
 }

@@ -26,9 +26,17 @@ public class AgentSyncService {
     public AgentSyncResponse synchronize(
             String username,
             String deviceUuid,
-            AgentSyncRequest request) {
+            AgentSyncRequest request,
+            String remoteAddress) {
 
-        AgentDevice device = deviceService.requireOwned(username, deviceUuid);
+        AgentDevice device = deviceService.activitySeen(
+                username,
+                deviceUuid,
+                request.sessionUuid(),
+                request.sessionStartedAt(),
+                request.sessionSequence(),
+                request.sentAt(),
+                remoteAddress);
         User user = deviceService.requireUser(username);
         List<ActivityAcknowledgement> acknowledgements = new ArrayList<>(request.records().size());
 

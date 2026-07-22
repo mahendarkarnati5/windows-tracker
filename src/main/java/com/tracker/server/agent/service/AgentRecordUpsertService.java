@@ -21,6 +21,7 @@ import com.tracker.server.agent.entity.AgentDevice;
 import com.tracker.server.agent.model.ActivityKind;
 import com.tracker.server.agent.model.ActivityState;
 import com.tracker.server.agent.repository.AgentActivityRepository;
+import com.tracker.server.agent.util.AgentTextLimits;
 import com.tracker.server.entity.ActiveWindowActivity;
 import com.tracker.server.entity.Device;
 import com.tracker.server.entity.DeviceSession;
@@ -116,10 +117,11 @@ public class AgentRecordUpsertService {
             return acknowledgement(current, "STALE");
         }
         if (current.getRevision() == request.revision()) {
-            if (current.getLegacyRecordId() == null) {
-                project(current, agentDevice, user);
-                activityRepository.save(current);
-            }
+            // The legacy projection may have been temporarily closed by the heartbeat
+            // timeout. Re-project the unchanged authoritative snapshot so a reconnect can
+            // restore a genuinely open record without inventing a new revision.
+            project(current, agentDevice, user);
+            activityRepository.save(current);
             return acknowledgement(current, "UNCHANGED");
         }
 
@@ -140,8 +142,8 @@ public class AgentRecordUpsertService {
         target.setState(source.state());
         target.setCloseReason(source.closeReason());
         target.setProcessId(source.processId());
-        target.setProcessName(source.processName());
-        target.setWindowTitle(source.windowTitle());
+        target.setProcessName(AgentTextLimits.processName(source.processName()));
+        target.setWindowTitle(AgentTextLimits.windowTitle(source.windowTitle()));
         target.setUpdatedAt(utc(Instant.now()));
     }
 
@@ -300,10 +302,23 @@ public class AgentRecordUpsertService {
     }
 
     private static String legacyStatus(AgentActivity activity) {
-        return switch (activity.getState()) {
-            case OPEN -> "RUNNING";
-            case CLOSED -> "CLOSED";
-            case INFERRED -> "INTERRUPTED";
-        };
+        if (activity.getState() == ActivityState.OPEN) {
+            return "RUNNING";
+        }
+        if (activity.getState() == ActivityState.INFERRED) {
+            return "INTERRUPTED";
+        }
+        if (activity.getKind() == ActivityKind.DEVICE_SESSION) {
+            String reason = activity.getCloseReason() == null
+                    ? ""
+                    : activity.getCloseReason().trim().toUpperCase();
+            return switch (reason) {
+                case "SYSTEM_SHUTDOWN", "SYSTEM_RESTART" -> "SHUTDOWN";
+                case "USER_LOGOFF" -> "LOGOFF";
+                case "AGENT_STOP" -> "STOPPED";
+                default -> "CLOSED";
+            };
+        }
+        return "CLOSED";
     }
 }

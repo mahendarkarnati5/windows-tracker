@@ -1,19 +1,16 @@
 package com.tracker.server.agent.dto;
 
 import java.time.Instant;
-import java.util.List;
 
 import jakarta.validation.constraints.Min;
-import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 
-public record AgentSyncRequest(
+public record AgentShutdownRequest(
+        @NotNull Instant shutdownAt,
         @NotBlank @Size(max = 36) String sessionUuid,
         @NotNull Instant sessionStartedAt,
         @Min(1) long sessionSequence,
-        @NotNull Instant sentAt,
-        @NotEmpty @Size(max = 250) List<@Valid ActivitySnapshotRequest> records) {
+        @NotBlank @Size(max = 64) String reason) {
 }

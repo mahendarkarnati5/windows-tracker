@@ -1,7 +1,10 @@
 package com.tracker.server.agent.service;
 
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.UUID;
 
 import org.springframework.http.HttpStatus;
@@ -11,6 +14,8 @@ import org.springframework.web.server.ResponseStatusException;
 
 import com.tracker.server.agent.dto.AgentEnrollmentRequest;
 import com.tracker.server.agent.dto.AgentEnrollmentResponse;
+import com.tracker.server.agent.dto.AgentPresenceRequest;
+import com.tracker.server.agent.dto.AgentShutdownRequest;
 import com.tracker.server.agent.entity.AgentDevice;
 import com.tracker.server.agent.repository.AgentDeviceRepository;
 import com.tracker.server.entity.Device;
@@ -24,10 +29,15 @@ import lombok.RequiredArgsConstructor;
 @RequiredArgsConstructor
 public class AgentDeviceService {
 
+    public static final String LIFECYCLE_ONLINE = "ONLINE";
+    public static final String LIFECYCLE_OFFLINE = "OFFLINE";
+    public static final String LIFECYCLE_SHUTDOWN = "SHUTDOWN";
+
     private final AgentDeviceRepository agentDeviceRepository;
     private final DeviceRepository deviceRepository;
     private final UserRepository userRepository;
     private final AgentCredentialService credentialService;
+    private final AgentProjectionService projectionService;
 
     @Transactional
     public AgentEnrollmentResponse enroll(
@@ -35,7 +45,7 @@ public class AgentDeviceService {
             AgentEnrollmentRequest request,
             String remoteAddress) {
 
-        String deviceUuid = canonicalUuid(request.deviceUuid());
+        String deviceUuid = canonicalUuid(request.deviceUuid(), "device UUID");
         User user = requireUser(username);
         LocalDateTime now = utcNow();
 
@@ -51,7 +61,8 @@ public class AgentDeviceService {
                 .orElseGet(() -> AgentDevice.builder()
                         .deviceUuid(deviceUuid)
                         .userId(user.getId())
-                        .legacyDeviceId(findOrCreateLegacyDevice(user, request, remoteAddress, now).getId())
+                        .legacyDeviceId(findOrCreateLegacyDevice(
+                                user, request, remoteAddress, now).getId())
                         .createdAt(now)
                         .build());
 
@@ -60,46 +71,131 @@ public class AgentDeviceService {
         mapping.setAgentVersion(request.agentVersion());
         mapping.setLastIpAddress(remoteAddress);
         mapping.setLastSeenAt(now);
+        if (mapping.getLifecycleState() == null) {
+            mapping.setLifecycleState(LIFECYCLE_ONLINE);
+            mapping.setLastLifecycleAt(now);
+        }
         mapping.setUpdatedAt(now);
         String deviceToken = credentialService.issue(mapping);
         mapping = agentDeviceRepository.save(mapping);
 
-        Device legacy = deviceRepository.findById(mapping.getLegacyDeviceId())
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.CONFLICT, "Mapped device no longer exists"));
-        legacy.setMachineName(request.machineName());
-        legacy.setOsName(request.osName());
-        legacy.setLastIpAddress(remoteAddress);
-        legacy.setLastSeen(now);
-        legacy.setStatus("ACTIVE");
-        legacy.setOnline(true);
-        legacy.setUninstalledAt(null);
-        deviceRepository.save(legacy);
+        // Enrollment proves that the program is running, but session ordering is established
+        // only by the first heartbeat/activity upload that contains a session UUID/start time.
+        if (!LIFECYCLE_SHUTDOWN.equalsIgnoreCase(mapping.getLifecycleState())) {
+            markLegacyOnline(mapping, remoteAddress, now);
+        }
 
         return new AgentEnrollmentResponse(
                 mapping.getDeviceUuid(), mapping.getLegacyDeviceId(), deviceToken);
     }
 
     @Transactional
-    public void heartbeat(String username, String requestedUuid, String remoteAddress) {
-        AgentDevice mapping = requireOwned(username, requestedUuid);
-        LocalDateTime now = utcNow();
-        mapping.setLastSeenAt(now);
-        mapping.setLastIpAddress(remoteAddress);
-        mapping.setUpdatedAt(now);
-        agentDeviceRepository.save(mapping);
+    public void heartbeat(
+            String username,
+            String requestedUuid,
+            AgentPresenceRequest request,
+            String remoteAddress) {
+        AgentDevice mapping = requireOwnedForUpdate(username, requestedUuid);
+        LocalDateTime serverNow = utcNow();
+        String sessionUuid = canonicalUuid(request.sessionUuid(), "session UUID");
+        LocalDateTime sessionStartedAt = safeClientTime(
+                request.sessionStartedAt(), serverNow, "session start");
+        long sessionSequence = requireSessionSequence(request.sessionSequence());
+        LocalDateTime observedAt = safeClientTime(
+                request.observedAt(), serverNow, "heartbeat time");
 
+        if (!acceptOnlineEvidence(
+                mapping,
+                sessionUuid,
+                sessionStartedAt,
+                sessionSequence,
+                observedAt,
+                serverNow,
+                remoteAddress)) {
+            return;
+        }
+
+        Set<String> openRecordUuids = canonicalRecordUuids(
+                new HashSet<>(request.openRecordUuids()));
+        projectionService.reconcileOpenRecords(mapping, openRecordUuids);
+        markLegacyOnline(mapping, remoteAddress, serverNow);
+    }
+
+    /**
+     * Every activity upload is presence evidence, but old-session uploads remain accepted for
+     * record reconciliation without being allowed to resurrect a device after shutdown or after
+     * a newer session has started.
+     */
+    @Transactional
+    public AgentDevice activitySeen(
+            String username,
+            String requestedUuid,
+            String sessionUuidValue,
+            Instant sessionStartedAtValue,
+            long sessionSequenceValue,
+            Instant sentAtValue,
+            String remoteAddress) {
+        AgentDevice mapping = requireOwnedForUpdate(username, requestedUuid);
+        LocalDateTime serverNow = utcNow();
+        String sessionUuid = canonicalUuid(sessionUuidValue, "session UUID");
+        LocalDateTime sessionStartedAt = safeClientTime(
+                sessionStartedAtValue, serverNow, "session start");
+        long sessionSequence = requireSessionSequence(sessionSequenceValue);
+        LocalDateTime sentAt = safeClientTime(sentAtValue, serverNow, "sync time");
+
+        boolean acceptedAsPresence = acceptOnlineEvidence(
+                mapping,
+                sessionUuid,
+                sessionStartedAt,
+                sessionSequence,
+                sentAt,
+                serverNow,
+                remoteAddress);
+        if (acceptedAsPresence) {
+            markLegacyOnline(mapping, remoteAddress, serverNow);
+        }
+        return mapping;
+    }
+
+    @Transactional
+    public void shutdown(
+            String username,
+            String requestedUuid,
+            AgentShutdownRequest request,
+            String remoteAddress) {
+        AgentDevice mapping = requireOwnedForUpdate(username, requestedUuid);
+        LocalDateTime serverNow = utcNow();
+        String sessionUuid = canonicalUuid(request.sessionUuid(), "session UUID");
+        LocalDateTime sessionStartedAt = safeClientTime(
+                request.sessionStartedAt(), serverNow, "session start");
+        long sessionSequence = requireSessionSequence(request.sessionSequence());
+        LocalDateTime shutdownAt = safeClientTime(
+                request.shutdownAt(), serverNow, "shutdown time");
+
+        if (!acceptShutdown(
+                mapping,
+                sessionUuid,
+                sessionStartedAt,
+                sessionSequence,
+                shutdownAt,
+                serverNow,
+                remoteAddress)) {
+            return;
+        }
+
+        projectionService.temporarilyCloseForShutdown(mapping, shutdownAt);
         deviceRepository.findById(mapping.getLegacyDeviceId()).ifPresent(device -> {
-            device.setLastSeen(now);
+            device.setLastSeen(max(device.getLastSeen(), shutdownAt));
             device.setLastIpAddress(remoteAddress);
-            device.setOnline(true);
+            device.setOnline(false);
+            device.setStatus(LIFECYCLE_SHUTDOWN);
             deviceRepository.save(device);
         });
     }
 
     @Transactional(readOnly = true)
     public AgentDevice requireOwned(String username, String requestedUuid) {
-        String deviceUuid = canonicalUuid(requestedUuid);
+        String deviceUuid = canonicalUuid(requestedUuid, "device UUID");
         User user = requireUser(username);
         return agentDeviceRepository.findByDeviceUuidAndUserId(deviceUuid, user.getId())
                 .orElseThrow(() -> new ResponseStatusException(
@@ -111,6 +207,136 @@ public class AgentDeviceService {
         return userRepository.findByUsername(username)
                 .orElseThrow(() -> new ResponseStatusException(
                         HttpStatus.UNAUTHORIZED, "Authenticated user no longer exists"));
+    }
+
+    private AgentDevice requireOwnedForUpdate(String username, String requestedUuid) {
+        String deviceUuid = canonicalUuid(requestedUuid, "device UUID");
+        User user = requireUser(username);
+        return agentDeviceRepository.findOwnedForUpdate(deviceUuid, user.getId())
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Device is not enrolled for this user"));
+    }
+
+    private boolean acceptOnlineEvidence(
+            AgentDevice mapping,
+            String incomingSessionUuid,
+            LocalDateTime incomingSessionStartedAt,
+            long incomingSessionSequence,
+            LocalDateTime eventAt,
+            LocalDateTime serverNow,
+            String remoteAddress) {
+
+        String currentSessionUuid = mapping.getCurrentSessionUuid();
+        boolean sameSession = incomingSessionUuid.equals(currentSessionUuid);
+
+        if (currentSessionUuid != null && !sameSession
+                && !isNewerSession(
+                        mapping,
+                        incomingSessionSequence,
+                        incomingSessionStartedAt,
+                        eventAt)) {
+            // Delayed heartbeat/upload from an older agent run. Its activity records may still be
+            // upserted, but it must never change current presence or lifecycle state.
+            return false;
+        }
+        if (sameSession && LIFECYCLE_SHUTDOWN.equalsIgnoreCase(mapping.getLifecycleState())) {
+            // Once a session has explicitly shut down, delayed requests from that same session
+            // cannot resurrect it. A real restart always creates a fresh session UUID.
+            return false;
+        }
+
+        if (!sameSession) {
+            mapping.setCurrentSessionUuid(incomingSessionUuid);
+            mapping.setCurrentSessionStartedAt(incomingSessionStartedAt);
+            mapping.setCurrentSessionSequence(incomingSessionSequence);
+        } else {
+            if (mapping.getCurrentSessionStartedAt() == null) {
+                mapping.setCurrentSessionStartedAt(incomingSessionStartedAt);
+            }
+            if (mapping.getCurrentSessionSequence() == null) {
+                mapping.setCurrentSessionSequence(incomingSessionSequence);
+            }
+        }
+        mapping.setLifecycleState(LIFECYCLE_ONLINE);
+        mapping.setLastLifecycleAt(max(mapping.getLastLifecycleAt(), eventAt));
+        // lastSeenAt intentionally uses server receipt time so heartbeat timeout is immune to a
+        // damaged or incorrectly configured client clock.
+        mapping.setLastSeenAt(serverNow);
+        mapping.setLastIpAddress(remoteAddress);
+        mapping.setUpdatedAt(serverNow);
+        agentDeviceRepository.save(mapping);
+        return true;
+    }
+
+    private boolean acceptShutdown(
+            AgentDevice mapping,
+            String incomingSessionUuid,
+            LocalDateTime incomingSessionStartedAt,
+            long incomingSessionSequence,
+            LocalDateTime shutdownAt,
+            LocalDateTime serverNow,
+            String remoteAddress) {
+
+        String currentSessionUuid = mapping.getCurrentSessionUuid();
+        boolean sameSession = incomingSessionUuid.equals(currentSessionUuid);
+
+        if (currentSessionUuid != null && !sameSession
+                && !isNewerSession(
+                        mapping,
+                        incomingSessionSequence,
+                        incomingSessionStartedAt,
+                        shutdownAt)) {
+            // A shutdown from an older session arrived after a newer boot. Ignore it completely.
+            return false;
+        }
+        mapping.setCurrentSessionUuid(incomingSessionUuid);
+        mapping.setCurrentSessionStartedAt(incomingSessionStartedAt);
+        mapping.setCurrentSessionSequence(incomingSessionSequence);
+        mapping.setLifecycleState(LIFECYCLE_SHUTDOWN);
+        mapping.setLastLifecycleAt(max(mapping.getLastLifecycleAt(), shutdownAt));
+        mapping.setLastSeenAt(serverNow);
+        mapping.setLastIpAddress(remoteAddress);
+        mapping.setUpdatedAt(serverNow);
+        agentDeviceRepository.save(mapping);
+        return true;
+    }
+
+    private static boolean isNewerSession(
+            AgentDevice mapping,
+            long incomingSessionSequence,
+            LocalDateTime incomingSessionStartedAt,
+            LocalDateTime incomingEventAt) {
+        Long currentSequence = mapping.getCurrentSessionSequence();
+        if (currentSequence != null) {
+            return incomingSessionSequence > currentSequence;
+        }
+        LocalDateTime currentStartedAt = mapping.getCurrentSessionStartedAt();
+        if (currentStartedAt != null) {
+            return !incomingSessionStartedAt.isBefore(currentStartedAt);
+        }
+        LocalDateTime lastLifecycleAt = mapping.getLastLifecycleAt();
+        return lastLifecycleAt == null || incomingEventAt.isAfter(lastLifecycleAt);
+    }
+
+    private void markLegacyOnline(
+            AgentDevice mapping,
+            String remoteAddress,
+            LocalDateTime seenAt) {
+        Device legacy = deviceRepository.findById(mapping.getLegacyDeviceId())
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.CONFLICT, "Mapped device no longer exists"));
+        if (mapping.getMachineName() != null) {
+            legacy.setMachineName(mapping.getMachineName());
+        }
+        if (mapping.getOsName() != null) {
+            legacy.setOsName(mapping.getOsName());
+        }
+        legacy.setLastIpAddress(remoteAddress);
+        legacy.setLastSeen(seenAt);
+        legacy.setStatus("ACTIVE");
+        legacy.setOnline(true);
+        legacy.setUninstalledAt(null);
+        deviceRepository.save(legacy);
     }
 
     private Device findOrCreateLegacyDevice(
@@ -140,12 +366,52 @@ public class AgentDeviceService {
         return deviceRepository.save(device);
     }
 
-    private static String canonicalUuid(String value) {
+    private static Set<String> canonicalRecordUuids(Set<String> values) {
+        Set<String> result = new HashSet<>();
+        for (String value : values) {
+            if (value == null || value.isBlank()) {
+                continue;
+            }
+            result.add(canonicalUuid(value, "record UUID"));
+        }
+        return Set.copyOf(result);
+    }
+
+    private static LocalDateTime safeClientTime(
+            Instant value,
+            LocalDateTime serverNow,
+            String fieldName) {
+        if (value == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, fieldName + " is required");
+        }
+        LocalDateTime candidate = LocalDateTime.ofInstant(value, ZoneOffset.UTC);
+        if (candidate.isAfter(serverNow.plusMinutes(5))) {
+            return serverNow;
+        }
+        // Very old values usually indicate a broken clock. Long-running/offline machines are still
+        // allowed a wide reconciliation window.
+        if (candidate.isBefore(serverNow.minusDays(180))) {
+            return serverNow;
+        }
+        return candidate;
+    }
+
+    private static String canonicalUuid(String value, String fieldName) {
         try {
             return UUID.fromString(value).toString();
         } catch (RuntimeException ex) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid UUID", ex);
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "Invalid " + fieldName, ex);
         }
+    }
+
+    private static long requireSessionSequence(long value) {
+        if (value < 1L) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "Invalid session sequence");
+        }
+        return value;
     }
 
     private static String normalizedMac(String value) {
@@ -153,6 +419,13 @@ public class AgentDeviceService {
             return null;
         }
         return value.trim().toUpperCase();
+    }
+
+    private static LocalDateTime max(LocalDateTime first, LocalDateTime second) {
+        if (first == null) {
+            return second;
+        }
+        return first.isAfter(second) ? first : second;
     }
 
     private static LocalDateTime utcNow() {

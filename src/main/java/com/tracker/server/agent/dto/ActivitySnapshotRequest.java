@@ -19,7 +19,7 @@ public record ActivitySnapshotRequest(
         @NotNull ActivityState state,
         @Size(max = 64) String closeReason,
         Long processId,
-        @Size(max = 512) String processName,
-        @Size(max = 1000) String windowTitle,
+        @Size(max = 2048) String processName,
+        @Size(max = 4096) String windowTitle,
         Long legacyRecordId) {
 }

@@ -11,6 +11,8 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.tracker.server.agent.dto.AgentEnrollmentRequest;
 import com.tracker.server.agent.dto.AgentEnrollmentResponse;
+import com.tracker.server.agent.dto.AgentPresenceRequest;
+import com.tracker.server.agent.dto.AgentShutdownRequest;
 import com.tracker.server.agent.dto.AgentSyncRequest;
 import com.tracker.server.agent.dto.AgentSyncResponse;
 import com.tracker.server.agent.service.AgentDeviceService;
@@ -41,9 +43,24 @@ public class AgentController {
     public ResponseEntity<Void> heartbeat(
             Authentication authentication,
             @PathVariable String deviceUuid,
+            @Valid @RequestBody AgentPresenceRequest request,
             HttpServletRequest servletRequest) {
         deviceService.heartbeat(
-                authentication.getName(), deviceUuid, servletRequest.getRemoteAddr());
+                authentication.getName(),
+                deviceUuid,
+                request,
+                servletRequest.getRemoteAddr());
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/devices/{deviceUuid}/shutdown")
+    public ResponseEntity<Void> shutdown(
+            Authentication authentication,
+            @PathVariable String deviceUuid,
+            @Valid @RequestBody AgentShutdownRequest request,
+            HttpServletRequest servletRequest) {
+        deviceService.shutdown(
+                authentication.getName(), deviceUuid, request, servletRequest.getRemoteAddr());
         return ResponseEntity.noContent().build();
     }
 
@@ -51,7 +68,9 @@ public class AgentController {
     public AgentSyncResponse synchronize(
             Authentication authentication,
             @PathVariable String deviceUuid,
-            @Valid @RequestBody AgentSyncRequest request) {
-        return syncService.synchronize(authentication.getName(), deviceUuid, request);
+            @Valid @RequestBody AgentSyncRequest request,
+            HttpServletRequest servletRequest) {
+        return syncService.synchronize(
+                authentication.getName(), deviceUuid, request, servletRequest.getRemoteAddr());
     }
 }
