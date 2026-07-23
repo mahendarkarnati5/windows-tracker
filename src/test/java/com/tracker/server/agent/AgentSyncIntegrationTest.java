@@ -26,10 +26,12 @@ import com.tracker.server.agent.repository.AgentActivityRepository;
 import com.tracker.server.agent.repository.AgentDeviceRepository;
 import com.tracker.server.agent.service.AgentRecordUpsertService;
 import com.tracker.server.agent.service.AgentProjectionService;
+import com.tracker.server.agent.service.ProjectionDuplicateRepairService;
 import com.tracker.server.agent.service.AgentCredentialService;
 import com.tracker.server.agent.service.AgentDeviceService;
 import com.tracker.server.agent.service.AgentSyncService;
 import com.tracker.server.entity.Device;
+import com.tracker.server.entity.ProcessActivity;
 import com.tracker.server.entity.User;
 import com.tracker.server.repository.ActiveWindowActivityRepository;
 import com.tracker.server.repository.DeviceRepository;
@@ -47,6 +49,7 @@ class AgentSyncIntegrationTest {
     @Autowired AgentCredentialService credentialService;
     @Autowired AgentSyncService syncService;
     @Autowired AgentDeviceService deviceService;
+    @Autowired ProjectionDuplicateRepairService duplicateRepairService;
     @Autowired AgentActivityRepository activityRepository;
     @Autowired AgentDeviceRepository agentDeviceRepository;
     @Autowired ProcessActivityRepository processRepository;
@@ -407,6 +410,118 @@ class AgentSyncIntegrationTest {
         var projection = windowRepository.findAll().getFirst();
         assertThat(projection.getWindowTitle().codePointCount(
                 0, projection.getWindowTitle().length())).isEqualTo(1_000);
+    }
+
+    @Test
+    void differentCanonicalUuidsForTheSameProcessShareOneProjectionRow() {
+        Instant start = Instant.parse("2026-07-22T17:38:37Z");
+        ActivitySnapshotRequest first = new ActivitySnapshotRequest(
+                UUID.randomUUID().toString(),
+                ActivityKind.PROCESS,
+                1,
+                start,
+                null,
+                ActivityState.OPEN,
+                null,
+                11056L,
+                "Taskmgr.exe",
+                null,
+                null);
+        ActivitySnapshotRequest repeated = new ActivitySnapshotRequest(
+                UUID.randomUUID().toString(),
+                ActivityKind.PROCESS,
+                1,
+                start.plusMillis(500),
+                null,
+                ActivityState.OPEN,
+                null,
+                11056L,
+                "Taskmgr.exe",
+                null,
+                null);
+
+        upsertService.apply(agentDevice, user, first);
+        upsertService.apply(agentDevice, user, repeated);
+
+        assertThat(activityRepository.count()).isEqualTo(2);
+        assertThat(processRepository.count()).isEqualTo(1);
+        Long projectionId = processRepository.findAll().getFirst().getId();
+        assertThat(activityRepository.findById(first.recordUuid()).orElseThrow().getLegacyRecordId())
+                .isEqualTo(projectionId);
+        assertThat(activityRepository.findById(repeated.recordUuid()).orElseThrow().getLegacyRecordId())
+                .isEqualTo(projectionId);
+    }
+
+    @Test
+    void startupRepairMergesExistingDuplicateProcessRows() {
+        Device device = deviceRepository.findById(agentDevice.getLegacyDeviceId()).orElseThrow();
+        LocalDateTime start = LocalDateTime.ofInstant(
+                Instant.parse("2026-07-22T17:38:37Z"), ZoneOffset.UTC);
+        processRepository.save(ProcessActivity.builder()
+                .pid(11056L)
+                .processName("Taskmgr.exe")
+                .startTime(start)
+                .status("RUNNING")
+                .device(device)
+                .user(user)
+                .build());
+        processRepository.save(ProcessActivity.builder()
+                .pid(11056L)
+                .processName("Taskmgr.exe")
+                .startTime(start)
+                .status("RUNNING")
+                .device(device)
+                .user(user)
+                .build());
+
+        duplicateRepairService.repairAll();
+
+        assertThat(processRepository.findByDeviceIdAndPidAndStartTimeOrderByIdDesc(
+                device.getId(), 11056L, start)).singleElement()
+                .satisfies(row -> {
+                    assertThat(row.getStatus()).isEqualTo("RUNNING");
+                    assertThat(row.getEndTime()).isNull();
+                    assertThat(row.getDurationSeconds()).isNull();
+                });
+    }
+
+
+    @Test
+    void duplicateRepairPreservesPidReuseHistoryAndLeavesOnlyNewestRunning() {
+        Device device = deviceRepository.findById(agentDevice.getLegacyDeviceId()).orElseThrow();
+        LocalDateTime oldStart = LocalDateTime.ofInstant(
+                Instant.parse("2026-07-22T17:00:00Z"), ZoneOffset.UTC);
+        LocalDateTime newStart = oldStart.plusMinutes(5);
+        processRepository.save(ProcessActivity.builder()
+                .pid(2000L)
+                .processName("old-app.exe")
+                .startTime(oldStart)
+                .status("RUNNING")
+                .device(device)
+                .user(user)
+                .build());
+        processRepository.save(ProcessActivity.builder()
+                .pid(2000L)
+                .processName("new-app.exe")
+                .startTime(newStart)
+                .status("RUNNING")
+                .device(device)
+                .user(user)
+                .build());
+
+        duplicateRepairService.repairAll();
+
+        var rows = processRepository.findByDeviceIdAndPidAndStatusOrderByStartTimeAscIdAsc(
+                device.getId(), 2000L, "RUNNING");
+        assertThat(rows).singleElement()
+                .satisfies(row -> assertThat(row.getProcessName()).isEqualTo("new-app.exe"));
+        var older = processRepository.findAll().stream()
+                .filter(row -> "old-app.exe".equals(row.getProcessName()))
+                .findFirst()
+                .orElseThrow();
+        assertThat(older.getStatus()).isEqualTo("INTERRUPTED");
+        assertThat(older.getEndTime()).isEqualTo(newStart);
+        assertThat(older.getDurationSeconds()).isEqualTo(300L);
     }
 
     @Test

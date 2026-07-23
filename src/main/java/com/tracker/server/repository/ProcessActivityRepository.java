@@ -52,11 +52,23 @@ public interface ProcessActivityRepository
 
     List<ProcessActivity> findByDeviceIdAndStatus(Long deviceId, String status);
 
-    Optional<ProcessActivity> findByDeviceIdAndPidAndStartTime(
+    Optional<ProcessActivity> findFirstByDeviceIdAndPidAndStartTimeOrderByIdDesc(
             Long deviceId, Long pid, LocalDateTime startTime);
 
-    Optional<ProcessActivity> findFirstByDeviceIdAndPidAndStatusOrderByIdDesc(
-            Long deviceId, Long pid, String status);
+    List<ProcessActivity> findByDeviceIdAndPidAndStartTimeOrderByIdDesc(
+            Long deviceId, Long pid, LocalDateTime startTime);
+
+    @Query("""
+           select p from ProcessActivity p
+           where p.device.id = :deviceId
+             and p.pid = :pid
+             and upper(p.status) = upper(:status)
+           order by p.startTime asc, p.id asc
+           """)
+    List<ProcessActivity> findByDeviceIdAndPidAndStatusOrderByStartTimeAscIdAsc(
+            @Param("deviceId") Long deviceId,
+            @Param("pid") Long pid,
+            @Param("status") String status);
 
     long countByDeviceIdAndStatus(Long deviceId, String status);
 
@@ -83,5 +95,41 @@ public interface ProcessActivityRepository
            where p.device is not null and upper(p.status) = 'RUNNING'
            """)
     List<Long> findDeviceIdsWithRunningRows();
+
+    @Query("""
+           select p.device.id, p.pid, p.startTime
+           from ProcessActivity p
+           where p.device is not null and p.pid is not null and p.startTime is not null
+           group by p.device.id, p.pid, p.startTime
+           having count(p.id) > 1
+           """)
+    List<Object[]> findDuplicateNaturalKeys();
+
+    List<ProcessActivity> findByDeviceIdAndPidOrderByStartTimeAscIdAsc(
+            Long deviceId, Long pid);
+
+    @Query("""
+           select p.device.id, p.pid
+           from ProcessActivity p
+           where p.device is not null and p.pid is not null
+             and upper(p.status) = 'RUNNING'
+           group by p.device.id, p.pid
+           having count(p.id) > 1
+           """)
+    List<Object[]> findDuplicateRunningKeys();
+
+    @Query("""
+           select distinct p.device.id, p.pid
+           from ProcessActivity p
+           where p.device is not null and p.pid is not null
+             and upper(p.status) = 'RUNNING'
+             and exists (
+                 select other.id from ProcessActivity other
+                 where other.device.id = p.device.id
+                   and other.pid = p.pid
+                   and other.id <> p.id
+             )
+           """)
+    List<Object[]> findRunningKeysWithOtherRows();
 
 }

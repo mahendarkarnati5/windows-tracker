@@ -32,6 +32,9 @@ public interface DeviceSessionRepository
 
     Optional<DeviceSession> findTopByDeviceIdOrderByStartupTimeDesc(Long deviceId);
 
+    List<DeviceSession> findByDeviceIdAndStartupTimeOrderByIdDesc(
+            Long deviceId, LocalDateTime startupTime);
+
     @Query("""
            select s from DeviceSession s
            where s.id in (
@@ -60,5 +63,14 @@ public interface DeviceSessionRepository
            where s.device is not null and upper(s.status) = 'RUNNING'
            """)
     List<Long> findDeviceIdsWithRunningRows();
+
+    @Query("""
+           select s.device.id, s.startupTime
+           from DeviceSession s
+           where s.device is not null and s.startupTime is not null
+           group by s.device.id, s.startupTime
+           having count(s.id) > 1
+           """)
+    List<Object[]> findDuplicateNaturalKeys();
 
 }

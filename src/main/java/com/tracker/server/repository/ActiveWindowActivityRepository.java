@@ -31,6 +31,9 @@ public interface ActiveWindowActivityRepository
     Optional<ActiveWindowActivity> findFirstByDeviceIdAndStatusOrderByStartTimeDesc(
             Long deviceId, String status);
 
+    List<ActiveWindowActivity> findByDeviceIdAndStartTimeAndWindowTitleOrderByIdDesc(
+            Long deviceId, LocalDateTime startTime, String windowTitle);
+
     @Modifying
     @Transactional
     @Query("""
@@ -60,5 +63,14 @@ public interface ActiveWindowActivityRepository
            where a.device is not null and upper(a.status) = 'RUNNING'
            """)
     List<Long> findDeviceIdsWithRunningRows();
+
+    @Query("""
+           select a.device.id, a.startTime, a.windowTitle
+           from ActiveWindowActivity a
+           where a.device is not null and a.startTime is not null and a.windowTitle is not null
+           group by a.device.id, a.startTime, a.windowTitle
+           having count(a.id) > 1
+           """)
+    List<Object[]> findDuplicateNaturalKeys();
 
 }

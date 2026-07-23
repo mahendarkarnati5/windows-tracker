@@ -30,6 +30,9 @@ public interface IdleActivityRepository
     Optional<IdleActivity> findFirstByDeviceIdAndStatusOrderByIdleStartDesc(
             Long deviceId, String status);
 
+    List<IdleActivity> findByDeviceIdAndIdleStartOrderByIdDesc(
+            Long deviceId, LocalDateTime idleStart);
+
     @Query("""
            select coalesce(sum(coalesce(i.idleSeconds, 0)), 0)
            from IdleActivity i
@@ -48,5 +51,14 @@ public interface IdleActivityRepository
            where i.device is not null and upper(i.status) = 'RUNNING'
            """)
     List<Long> findDeviceIdsWithRunningRows();
+
+    @Query("""
+           select i.device.id, i.idleStart
+           from IdleActivity i
+           where i.device is not null and i.idleStart is not null
+           group by i.device.id, i.idleStart
+           having count(i.id) > 1
+           """)
+    List<Object[]> findDuplicateNaturalKeys();
 
 }

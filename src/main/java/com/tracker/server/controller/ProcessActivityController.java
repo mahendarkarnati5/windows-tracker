@@ -12,6 +12,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -110,37 +111,54 @@ public class ProcessActivityController {
     
     
     @PostMapping("/{deviceId}")
+    @Transactional
     public ProcessActivity save(
             @PathVariable Long deviceId,
             @RequestBody ProcessActivity activity) {
 
         Device device =
-                deviceRepository.findById(deviceId)
+                deviceRepository.findByIdForUpdate(deviceId)
                         .orElseThrow();
 
         // Duplicate check
-        Optional<ProcessActivity> existing =
-                processRepository.findByDeviceIdAndPidAndStartTime(
+        Optional<ProcessActivity> existing = activity.getPid() == null || activity.getStartTime() == null
+                ? Optional.empty()
+                : processRepository.findFirstByDeviceIdAndPidAndStartTimeOrderByIdDesc(
                         deviceId,
                         activity.getPid(),
                         activity.getStartTime());
 
         if (existing.isPresent()) {
+            return mergeLegacyProcess(existing.get(), activity);
+        }
 
-            ProcessActivity db = existing.get();
+        if (activity.getPid() != null && activity.getStartTime() != null) {
+            for (ProcessActivity running : processRepository
+                    .findByDeviceIdAndPidAndStatusOrderByStartTimeAscIdAsc(
+                            deviceId, activity.getPid(), "RUNNING")) {
+                boolean sameName = running.getProcessName() != null
+                        && activity.getProcessName() != null
+                        && running.getProcessName().equalsIgnoreCase(activity.getProcessName());
+                long difference = running.getStartTime() == null
+                        ? Long.MAX_VALUE
+                        : Math.abs(Duration.between(
+                                running.getStartTime(), activity.getStartTime()).toSeconds());
+                if (sameName && difference <= 10L) {
+                    return mergeLegacyProcess(running, activity);
+                }
 
-            // Update only if this is a CLOSED event
-            if ("CLOSED".equals(activity.getStatus())) {
-
-                db.setEndTime(activity.getEndTime());
-                db.setDurationSeconds(activity.getDurationSeconds());
-                db.setStatus(activity.getStatus());
-
-                return processRepository.save(db);
+                LocalDateTime end = running.getStartTime() != null
+                                && !activity.getStartTime().isBefore(running.getStartTime())
+                        ? activity.getStartTime()
+                        : null;
+                running.setEndTime(end);
+                running.setDurationSeconds(end == null || running.getStartTime() == null
+                        ? null
+                        : Math.max(0L, Duration.between(
+                                running.getStartTime(), end).toSeconds()));
+                running.setStatus("INTERRUPTED");
+                processRepository.save(running);
             }
-
-            // Already exists
-            return db;
         }
 
         activity.setDevice(device);
@@ -152,6 +170,38 @@ public class ProcessActivityController {
 
     
     
+    private ProcessActivity mergeLegacyProcess(
+            ProcessActivity existing, ProcessActivity incoming) {
+        if (incoming.getStartTime() != null
+                && (existing.getStartTime() == null
+                        || incoming.getStartTime().isBefore(existing.getStartTime()))) {
+            existing.setStartTime(incoming.getStartTime());
+        }
+        if (incoming.getProcessName() != null && !incoming.getProcessName().isBlank()) {
+            existing.setProcessName(incoming.getProcessName());
+        }
+        if ("RUNNING".equalsIgnoreCase(incoming.getStatus())) {
+            // A retry or reconnect may arrive after heartbeat timeout temporarily
+            // closed the legacy row. The agent's RUNNING snapshot is authoritative.
+            existing.setEndTime(null);
+            existing.setDurationSeconds(null);
+            existing.setStatus("RUNNING");
+        } else {
+            LocalDateTime end = incoming.getEndTime();
+            if (end != null && existing.getStartTime() != null
+                    && end.isBefore(existing.getStartTime())) {
+                end = null;
+            }
+            existing.setEndTime(end);
+            existing.setDurationSeconds(end == null || existing.getStartTime() == null
+                    ? null
+                    : Math.max(0L, Duration.between(
+                            existing.getStartTime(), end).toSeconds()));
+            existing.setStatus(incoming.getStatus());
+        }
+        return processRepository.save(existing);
+    }
+
     @PutMapping("/{id}")
     public ProcessActivity updateProcess(
             @PathVariable Long id,
