@@ -92,3 +92,18 @@ Dashboard flow:
 5. Full information provides Processes, Active windows, Idle periods, and Sessions tabs with server-side pagination, partial text matching after two characters, date/status/time filters, sortable columns, and filtered-duration totals.
 
 The default activity view is Today in descending order. Filtered duration is deliberately not calculated or displayed until the admin applies a filter, which avoids an unnecessary aggregate query on initial page load.
+
+
+## v2.2.7 database startup settings
+
+Recommended Render values:
+
+```text
+DB_CONNECTION_TIMEOUT_MS=30000
+DB_VALIDATION_TIMEOUT_MS=5000
+DB_CONNECT_RETRIES=10
+DB_CONNECT_RETRY_INTERVAL=5s
+AGENT_DUPLICATE_REPAIR_ENABLED=false
+```
+
+Do not set MySQL `connectTimeout` or `socketTimeout` to 5000 in `TIDB_URL`.
