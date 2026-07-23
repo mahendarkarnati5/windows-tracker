@@ -3,6 +3,7 @@ package com.tracker.server.security;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Component;
 
@@ -13,6 +14,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 @Component
+@ConditionalOnProperty(name = "tracker.bootstrap-admin.enabled", havingValue = "true")
 @RequiredArgsConstructor
 @Slf4j
 public class AdminBootstrap implements ApplicationRunner {

@@ -44,6 +44,7 @@ public class SecurityConfig {
                                 "/index.html",
                                 "/assets/**",
                                 "/favicon.ico",
+                                "/health/live",
                                 "/error").permitAll()
                         .requestMatchers(HttpMethod.POST,
                                 "/api/auth/register",

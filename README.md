@@ -1,3 +1,5 @@
+# Tracker Server v2.2.8 - Stable Startup and Fast Sync
+
 # Tracker Server
 
 Tracker Server accepts idempotent activity snapshots from Tracker Agent v2 while continuing to populate the existing reporting tables used by the admin application.
