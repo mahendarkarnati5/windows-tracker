@@ -572,4 +572,54 @@ class AgentSyncIntegrationTest {
         assertThat(corrected.getDurationSeconds()).isEqualTo(30L);
     }
 
+    @Test
+    void authoritativeCloseReusesTemporarilyOfflineNearDuplicateProcess() {
+        Instant start = Instant.parse("2026-07-23T06:00:00Z");
+        String firstUuid = UUID.randomUUID().toString();
+        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
+                firstUuid,
+                ActivityKind.PROCESS,
+                1,
+                start,
+                null,
+                ActivityState.OPEN,
+                null,
+                8288L,
+                "msiexec.exe",
+                null,
+                null));
+
+        projectionService.temporarilyCloseForOffline(
+                agentDevice,
+                LocalDateTime.ofInstant(start.plusSeconds(10), ZoneOffset.UTC));
+
+        String replayUuid = UUID.randomUUID().toString();
+        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
+                replayUuid,
+                ActivityKind.PROCESS,
+                2,
+                start.plusSeconds(2),
+                start.plusSeconds(20),
+                ActivityState.CLOSED,
+                "PROCESS_EXIT",
+                8288L,
+                "msiexec.exe",
+                null,
+                null));
+
+        assertThat(processRepository.count()).isEqualTo(1);
+        var projection = processRepository.findAll().getFirst();
+        assertThat(projection.getStatus()).isEqualTo("CLOSED");
+        assertThat(projection.getStartTime())
+                .isEqualTo(LocalDateTime.ofInstant(start, ZoneOffset.UTC));
+        assertThat(projection.getEndTime())
+                .isEqualTo(LocalDateTime.ofInstant(start.plusSeconds(20), ZoneOffset.UTC));
+        assertThat(projection.getDurationSeconds()).isEqualTo(20L);
+        assertThat(activityRepository.findById(firstUuid).orElseThrow().getLegacyRecordId())
+                .isEqualTo(projection.getId());
+        assertThat(activityRepository.findById(replayUuid).orElseThrow().getLegacyRecordId())
+                .isEqualTo(projection.getId());
+    }
+
+
 }

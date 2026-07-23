@@ -1,5 +1,6 @@
 package com.tracker.server.agent.service;
 
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -9,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 @Component
+@ConditionalOnProperty(name = "tracker.agent.duplicate-repair-enabled", havingValue = "true")
 @RequiredArgsConstructor
 @Slf4j
 public class ProjectionDuplicateRepairScheduler {

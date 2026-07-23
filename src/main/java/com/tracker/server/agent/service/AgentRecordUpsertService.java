@@ -6,7 +6,6 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.UUID;
 
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -60,7 +59,7 @@ public class AgentRecordUpsertService {
         this.idleRepository = idleRepository;
         this.sessionRepository = sessionRepository;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
-        this.transactionTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        this.transactionTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
     }
 
     public ActivityAcknowledgement apply(
@@ -70,20 +69,22 @@ public class AgentRecordUpsertService {
 
         String recordUuid = canonicalUuid(request.recordUuid());
         validate(request);
+        return transactionTemplate.execute(status ->
+                applyInTransaction(agentDevice, user, request, recordUuid));
+    }
 
-        // A concurrent first insert can race because no row exists to lock. The primary
-        // key resolves that race; retrying in a fresh transaction then locks the winner.
-        for (int attempt = 0; attempt < 2; attempt++) {
-            try {
-                return transactionTemplate.execute(status ->
-                        applyInTransaction(agentDevice, user, request, recordUuid));
-            } catch (DataIntegrityViolationException ex) {
-                if (attempt == 1) {
-                    throw ex;
-                }
-            }
-        }
-        throw new IllegalStateException("Unable to apply activity record");
+    /**
+     * Used by AgentSyncService while its one batch transaction is already active.
+     * Validation failures can be acknowledged per record without marking the whole
+     * batch transaction rollback-only.
+     */
+    ActivityAcknowledgement applyInBatch(
+            AgentDevice agentDevice,
+            User user,
+            ActivitySnapshotRequest request) {
+        String recordUuid = canonicalUuid(request.recordUuid());
+        validate(request);
+        return applyInTransaction(agentDevice, user, request, recordUuid);
     }
 
     private ActivityAcknowledgement applyInTransaction(
@@ -92,11 +93,9 @@ public class AgentRecordUpsertService {
             ActivitySnapshotRequest request,
             String recordUuid) {
 
-        // Lock order is always device first, then canonical activity. The duplicate-repair
-        // service follows the same order, preventing a periodic repair from deadlocking
-        // with a live agent sync. It also serializes different record UUIDs that describe
-        // the same process lifecycle on one device.
-        Device device = deviceRepository.findByIdForUpdate(agentDevice.getLegacyDeviceId())
+        // AgentSyncService holds one short transaction and one agent-device lock for the
+        // complete upload batch. Do not acquire the legacy device lock again for every row.
+        Device device = deviceRepository.findById(agentDevice.getLegacyDeviceId())
                 .orElseThrow(() -> new IllegalStateException("Mapped device no longer exists"));
         AgentActivity current = activityRepository.findByRecordUuidForUpdate(recordUuid).orElse(null);
 
@@ -111,7 +110,7 @@ public class AgentRecordUpsertService {
                     .createdAt(utc(Instant.now()))
                     .build();
             copySnapshot(current, request);
-            current = activityRepository.saveAndFlush(current);
+            current = activityRepository.save(current);
             project(current, device, user);
             activityRepository.save(current);
             return acknowledgement(current, "APPLIED");
@@ -216,11 +215,14 @@ public class AgentRecordUpsertService {
             target.setStartTime(source.getStartedAt());
         }
         target.setEndTime(source.getEndedAt());
-        target.setDurationSeconds(seconds(source.getDurationMillis()));
+        target.setDurationSeconds(source.getEndedAt() == null || target.getStartTime() == null
+                ? null
+                : Math.max(0L, Duration.between(
+                        target.getStartTime(), source.getEndedAt()).toSeconds()));
         target.setStatus(legacyStatus(source));
         target.setDevice(device);
         target.setUser(user);
-        return processRepository.saveAndFlush(target).getId();
+        return processRepository.save(target).getId();
     }
 
     private ProcessActivity existingProcessTarget(AgentActivity source, Device device) {
@@ -233,6 +235,22 @@ public class AgentRecordUpsertService {
                     device.getId(), source.getProcessId(), source.getStartedAt());
             if (!naturalMatches.isEmpty()) {
                 return naturalMatches.getFirst();
+            }
+
+            LocalDateTime nearStart = source.getStartedAt().minusSeconds(10);
+            LocalDateTime nearEnd = source.getStartedAt().plusSeconds(10);
+            var nearMatches = processRepository
+                    .findByDeviceIdAndPidAndStartTimeBetweenOrderByIdDesc(
+                            device.getId(), source.getProcessId(), nearStart, nearEnd);
+            for (ProcessActivity candidate : nearMatches) {
+                boolean sameName = candidate.getProcessName() != null
+                        && source.getProcessName() != null
+                        && candidate.getProcessName().equalsIgnoreCase(source.getProcessName());
+                boolean overlapsIncomingStart = candidate.getEndTime() == null
+                        || !candidate.getEndTime().isBefore(source.getStartedAt());
+                if (sameName && overlapsIncomingStart) {
+                    return candidate;
+                }
             }
 
             var runningForPid = processRepository
@@ -287,7 +305,7 @@ public class AgentRecordUpsertService {
             target.setOfflineId(source.getRecordUuid());
         }
         target.setDevice(device);
-        return windowRepository.saveAndFlush(target).getId();
+        return windowRepository.save(target).getId();
     }
 
     private ActiveWindowActivity existingWindowTarget(AgentActivity source, Device device) {
@@ -326,7 +344,7 @@ public class AgentRecordUpsertService {
         target.setStatus(legacyStatus(source));
         target.setDevice(device);
         target.setUser(user);
-        return idleRepository.saveAndFlush(target).getId();
+        return idleRepository.save(target).getId();
     }
 
     private IdleActivity existingIdleTarget(AgentActivity source, Device device) {
@@ -357,7 +375,7 @@ public class AgentRecordUpsertService {
         target.setStatus(legacyStatus(source));
         target.setDevice(device);
         target.setUser(user);
-        return sessionRepository.saveAndFlush(target).getId();
+        return sessionRepository.save(target).getId();
     }
 
     private DeviceSession existingSessionTarget(AgentActivity source, Device device) {

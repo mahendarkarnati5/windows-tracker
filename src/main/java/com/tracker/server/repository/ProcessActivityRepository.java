@@ -58,6 +58,12 @@ public interface ProcessActivityRepository
     List<ProcessActivity> findByDeviceIdAndPidAndStartTimeOrderByIdDesc(
             Long deviceId, Long pid, LocalDateTime startTime);
 
+    List<ProcessActivity> findByDeviceIdAndPidAndStartTimeBetweenOrderByIdDesc(
+            Long deviceId,
+            Long pid,
+            LocalDateTime fromStart,
+            LocalDateTime toStart);
+
     @Query("""
            select p from ProcessActivity p
            where p.device.id = :deviceId

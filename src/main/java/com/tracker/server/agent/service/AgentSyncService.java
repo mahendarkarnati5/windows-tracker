@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 
 import com.tracker.server.agent.dto.ActivityAcknowledgement;
@@ -23,6 +24,7 @@ public class AgentSyncService {
     private final AgentDeviceService deviceService;
     private final AgentRecordUpsertService upsertService;
 
+    @Transactional
     public AgentSyncResponse synchronize(
             String username,
             String deviceUuid,
@@ -42,7 +44,7 @@ public class AgentSyncService {
 
         for (ActivitySnapshotRequest record : request.records()) {
             try {
-                acknowledgements.add(upsertService.apply(device, user, record));
+                acknowledgements.add(upsertService.applyInBatch(device, user, record));
             } catch (ResponseStatusException ex) {
                 acknowledgements.add(new ActivityAcknowledgement(
                         record.recordUuid(),
