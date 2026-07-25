@@ -25,6 +25,23 @@ public interface ActiveWindowActivityRepository
 
     List<ActiveWindowActivity> findByDeviceIdAndStatus(Long deviceId, String status);
 
+    Optional<ActiveWindowActivity> findFirstByDeviceIdAndNaturalKeyOrderByIdDesc(
+            Long deviceId, String naturalKey);
+
+    Optional<ActiveWindowActivity> findFirstByDeviceIdAndPidAndProcessNameIgnoreCaseAndWindowTitleAndStartTimeAndEndTimeIsNullOrderByIdDesc(
+            Long deviceId,
+            Long pid,
+            String processName,
+            String windowTitle,
+            LocalDateTime startTime);
+
+    Optional<ActiveWindowActivity> findFirstByDeviceIdAndPidAndProcessNameIgnoreCaseAndWindowTitleAndStartTimeOrderByIdDesc(
+            Long deviceId,
+            Long pid,
+            String processName,
+            String windowTitle,
+            LocalDateTime startTime);
+
     Optional<ActiveWindowActivity> findFirstByDeviceIdAndWindowTitleAndStatusOrderByStartTimeDesc(
             Long deviceId, String windowTitle, String status);
 

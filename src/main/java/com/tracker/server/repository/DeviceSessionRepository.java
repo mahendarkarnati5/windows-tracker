@@ -30,6 +30,12 @@ public interface DeviceSessionRepository
 
     List<DeviceSession> findByDeviceIdAndStatus(Long deviceId, String status);
 
+    Optional<DeviceSession> findFirstByDeviceIdAndNaturalKeyOrderByIdDesc(
+            Long deviceId, String naturalKey);
+
+    Optional<DeviceSession> findFirstByDeviceIdAndStartupTimeAndShutdownTimeIsNullOrderByIdDesc(
+            Long deviceId, LocalDateTime startupTime);
+
     Optional<DeviceSession> findTopByDeviceIdOrderByStartupTimeDesc(Long deviceId);
 
     List<DeviceSession> findByDeviceIdAndStartupTimeOrderByIdDesc(

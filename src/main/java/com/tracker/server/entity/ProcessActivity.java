@@ -41,6 +41,9 @@ public class ProcessActivity {
 
     private String status;
 
+    @Column(name = "natural_key", length = 64)
+    private String naturalKey;
+
     @ManyToOne
     @JoinColumn(name = "device_id")
     private Device device;

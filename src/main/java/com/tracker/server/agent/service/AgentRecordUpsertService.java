@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.Objects;
 import java.util.UUID;
 
 import org.springframework.http.HttpStatus;
@@ -20,6 +21,7 @@ import com.tracker.server.agent.entity.AgentDevice;
 import com.tracker.server.agent.model.ActivityKind;
 import com.tracker.server.agent.model.ActivityState;
 import com.tracker.server.agent.repository.AgentActivityRepository;
+import com.tracker.server.agent.util.ActivityNaturalKey;
 import com.tracker.server.agent.util.AgentTextLimits;
 import com.tracker.server.entity.ActiveWindowActivity;
 import com.tracker.server.entity.Device;
@@ -66,39 +68,42 @@ public class AgentRecordUpsertService {
             AgentDevice agentDevice,
             User user,
             ActivitySnapshotRequest request) {
-
         String recordUuid = canonicalUuid(request.recordUuid());
         validate(request);
         return transactionTemplate.execute(status ->
-                applyInTransaction(agentDevice, user, request, recordUuid));
+                applyInTransaction(
+                        agentDevice,
+                        user,
+                        requireLegacyDevice(agentDevice),
+                        request,
+                        recordUuid,
+                        activityRepository.findByRecordUuidForUpdate(recordUuid).orElse(null)));
     }
 
-    /**
-     * Used by AgentSyncService while its one batch transaction is already active.
-     * Validation failures can be acknowledged per record without marking the whole
-     * batch transaction rollback-only.
-     */
     ActivityAcknowledgement applyInBatch(
             AgentDevice agentDevice,
             User user,
-            ActivitySnapshotRequest request) {
+            Device device,
+            ActivitySnapshotRequest request,
+            AgentActivity current) {
         String recordUuid = canonicalUuid(request.recordUuid());
         validate(request);
-        return applyInTransaction(agentDevice, user, request, recordUuid);
+        return applyInTransaction(
+                agentDevice, user, device, request, recordUuid, current);
+    }
+
+    Device requireLegacyDevice(AgentDevice agentDevice) {
+        return deviceRepository.findById(agentDevice.getLegacyDeviceId())
+                .orElseThrow(() -> new IllegalStateException("Mapped device no longer exists"));
     }
 
     private ActivityAcknowledgement applyInTransaction(
             AgentDevice agentDevice,
             User user,
+            Device device,
             ActivitySnapshotRequest request,
-            String recordUuid) {
-
-        // AgentSyncService holds one short transaction and one agent-device lock for the
-        // complete upload batch. Do not acquire the legacy device lock again for every row.
-        Device device = deviceRepository.findById(agentDevice.getLegacyDeviceId())
-                .orElseThrow(() -> new IllegalStateException("Mapped device no longer exists"));
-        AgentActivity current = activityRepository.findByRecordUuidForUpdate(recordUuid).orElse(null);
-
+            String recordUuid,
+            AgentActivity current) {
         if (current == null) {
             current = AgentActivity.builder()
                     .recordUuid(recordUuid)
@@ -110,30 +115,25 @@ public class AgentRecordUpsertService {
                     .createdAt(utc(Instant.now()))
                     .build();
             copySnapshot(current, request);
-            current = activityRepository.save(current);
             project(current, device, user);
             activityRepository.save(current);
             return acknowledgement(current, "APPLIED");
         }
 
         assertOwnershipAndKind(current, agentDevice, user, request.kind());
-
         if (current.getRevision() > request.revision()) {
             return acknowledgement(current, "STALE");
         }
-        if (current.getRevision() == request.revision()) {
-            // The legacy projection may have been temporarily closed by the heartbeat
-            // timeout. Re-project the unchanged authoritative snapshot so a reconnect can
-            // restore a genuinely open record without inventing a new revision.
-            project(current, device, user);
-            activityRepository.save(current);
-            return acknowledgement(current, "UNCHANGED");
+        boolean changed = current.getRevision() < request.revision();
+        if (changed) {
+            copySnapshot(current, request);
         }
 
-        copySnapshot(current, request);
+        // Re-project equal revisions as well. This safely repairs a projection after a
+        // reconnect without creating a second activity row.
         project(current, device, user);
         activityRepository.save(current);
-        return acknowledgement(current, "APPLIED");
+        return acknowledgement(current, changed ? "APPLIED" : "UNCHANGED");
     }
 
     private static void copySnapshot(AgentActivity target, ActivitySnapshotRequest source) {
@@ -208,80 +208,54 @@ public class AgentRecordUpsertService {
     }
 
     private Long projectProcess(AgentActivity source, Device device, User user) {
-        ProcessActivity target = existingProcessTarget(source, device);
+        String naturalKey = ActivityNaturalKey.of(source);
+        ProcessActivity target = mappedProcess(source, device);
+        if (target == null) {
+            target = processRepository
+                    .findFirstByDeviceIdAndPidAndProcessNameIgnoreCaseAndStartTimeAndEndTimeIsNullOrderByIdDesc(
+                            device.getId(),
+                            source.getProcessId(),
+                            source.getProcessName(),
+                            source.getStartedAt())
+                    .orElse(null);
+        }
+        if (target == null) {
+            target = processRepository
+                    .findFirstByDeviceIdAndPidAndProcessNameIgnoreCaseAndStartTimeOrderByIdDesc(
+                            device.getId(),
+                            source.getProcessId(),
+                            source.getProcessName(),
+                            source.getStartedAt())
+                    .orElse(null);
+        }
+        if (target == null) {
+            target = processRepository
+                    .findFirstByDeviceIdAndNaturalKeyOrderByIdDesc(device.getId(), naturalKey)
+                    .orElseGet(ProcessActivity::new);
+        }
+
+        if (source.getState() == ActivityState.OPEN
+                && target.getId() != null
+                && target.getEndTime() != null) {
+            return target.getId();
+        }
+
+        boolean newProjection = target.getId() == null;
+        if (source.getState() == ActivityState.OPEN && newProjection) {
+            closeOtherRunningProcesses(
+                    device.getId(), source.getProcessId(), null, source.getStartedAt());
+        }
+
         target.setPid(source.getProcessId());
         target.setProcessName(source.getProcessName());
-        if (target.getStartTime() == null || source.getStartedAt().isBefore(target.getStartTime())) {
-            target.setStartTime(source.getStartedAt());
-        }
+        target.setStartTime(source.getStartedAt());
         target.setEndTime(source.getEndedAt());
-        target.setDurationSeconds(source.getEndedAt() == null || target.getStartTime() == null
-                ? null
-                : Math.max(0L, Duration.between(
-                        target.getStartTime(), source.getEndedAt()).toSeconds()));
+        target.setDurationSeconds(seconds(source.getDurationMillis()));
         target.setStatus(legacyStatus(source));
+        target.setNaturalKey(naturalKey);
         target.setDevice(device);
         target.setUser(user);
         return processRepository.save(target).getId();
-    }
-
-    private ProcessActivity existingProcessTarget(AgentActivity source, Device device) {
-        ProcessActivity mapped = mappedProcess(source, device);
-        if (mapped != null) {
-            return mapped;
-        }
-        if (source.getProcessId() != null && source.getStartedAt() != null) {
-            var naturalMatches = processRepository.findByDeviceIdAndPidAndStartTimeOrderByIdDesc(
-                    device.getId(), source.getProcessId(), source.getStartedAt());
-            if (!naturalMatches.isEmpty()) {
-                return naturalMatches.getFirst();
-            }
-
-            LocalDateTime nearStart = source.getStartedAt().minusSeconds(10);
-            LocalDateTime nearEnd = source.getStartedAt().plusSeconds(10);
-            var nearMatches = processRepository
-                    .findByDeviceIdAndPidAndStartTimeBetweenOrderByIdDesc(
-                            device.getId(), source.getProcessId(), nearStart, nearEnd);
-            for (ProcessActivity candidate : nearMatches) {
-                boolean sameName = candidate.getProcessName() != null
-                        && source.getProcessName() != null
-                        && candidate.getProcessName().equalsIgnoreCase(source.getProcessName());
-                boolean overlapsIncomingStart = candidate.getEndTime() == null
-                        || !candidate.getEndTime().isBefore(source.getStartedAt());
-                if (sameName && overlapsIncomingStart) {
-                    return candidate;
-                }
-            }
-
-            var runningForPid = processRepository
-                    .findByDeviceIdAndPidAndStatusOrderByStartTimeAscIdAsc(
-                            device.getId(), source.getProcessId(), "RUNNING");
-            for (ProcessActivity running : runningForPid) {
-                boolean sameName = running.getProcessName() != null
-                        && source.getProcessName() != null
-                        && running.getProcessName().equalsIgnoreCase(source.getProcessName());
-                long startDifference = running.getStartTime() == null
-                        ? Long.MAX_VALUE
-                        : Math.abs(Duration.between(
-                                running.getStartTime(), source.getStartedAt()).toSeconds());
-                if (sameName && startDifference <= 10L) {
-                    return running;
-                }
-
-                LocalDateTime inferredEnd = running.getStartTime() != null
-                                && !source.getStartedAt().isBefore(running.getStartTime())
-                        ? source.getStartedAt()
-                        : null;
-                running.setEndTime(inferredEnd);
-                running.setDurationSeconds(inferredEnd == null || running.getStartTime() == null
-                        ? null
-                        : Math.max(0L, Duration.between(
-                                running.getStartTime(), inferredEnd).toSeconds()));
-                running.setStatus("INTERRUPTED");
-                processRepository.save(running);
-            }
-        }
-        return new ProcessActivity();
     }
 
     private ProcessActivity mappedProcess(AgentActivity source, Device device) {
@@ -295,12 +269,57 @@ public class AgentRecordUpsertService {
     }
 
     private Long projectWindow(AgentActivity source, Device device) {
-        ActiveWindowActivity target = existingWindowTarget(source, device);
+        String naturalKey = ActivityNaturalKey.of(source);
+        ActiveWindowActivity target = mappedWindow(source, device);
+        if (target == null) {
+            target = windowRepository
+                    .findFirstByDeviceIdAndPidAndProcessNameIgnoreCaseAndWindowTitleAndStartTimeAndEndTimeIsNullOrderByIdDesc(
+                            device.getId(),
+                            source.getProcessId(),
+                            source.getProcessName(),
+                            source.getWindowTitle(),
+                            source.getStartedAt())
+                    .orElse(null);
+        }
+        if (target == null) {
+            target = windowRepository
+                    .findFirstByDeviceIdAndPidAndProcessNameIgnoreCaseAndWindowTitleAndStartTimeOrderByIdDesc(
+                            device.getId(),
+                            source.getProcessId(),
+                            source.getProcessName(),
+                            source.getWindowTitle(),
+                            source.getStartedAt())
+                    .orElse(null);
+        }
+        if (target == null) {
+            target = windowRepository
+                    .findByDeviceIdAndStartTimeAndWindowTitleOrderByIdDesc(
+                            device.getId(), source.getStartedAt(), source.getWindowTitle())
+                    .stream().findFirst().orElse(null);
+        }
+        if (target == null) {
+            target = windowRepository
+                    .findFirstByDeviceIdAndNaturalKeyOrderByIdDesc(device.getId(), naturalKey)
+                    .orElseGet(ActiveWindowActivity::new);
+        }
+
+        if (source.getState() == ActivityState.OPEN
+                && target.getId() != null
+                && target.getEndTime() != null) {
+            return target.getId();
+        }
+        if (source.getState() == ActivityState.OPEN) {
+            closeOtherRunningWindows(device.getId(), target.getId(), source.getStartedAt());
+        }
+
+        target.setPid(source.getProcessId());
+        target.setProcessName(source.getProcessName());
         target.setWindowTitle(source.getWindowTitle());
         target.setStartTime(source.getStartedAt());
         target.setEndTime(source.getEndedAt());
         target.setDurationSeconds(seconds(source.getDurationMillis()));
         target.setStatus(legacyStatus(source));
+        target.setNaturalKey(naturalKey);
         if (target.getOfflineId() == null || target.getOfflineId().isBlank()) {
             target.setOfflineId(source.getRecordUuid());
         }
@@ -308,7 +327,7 @@ public class AgentRecordUpsertService {
         return windowRepository.save(target).getId();
     }
 
-    private ActiveWindowActivity existingWindowTarget(AgentActivity source, Device device) {
+    private ActiveWindowActivity mappedWindow(AgentActivity source, Device device) {
         if (source.getLegacyRecordId() != null) {
             ActiveWindowActivity mapped = windowRepository.findById(source.getLegacyRecordId())
                     .filter(row -> row.getDevice() != null
@@ -318,107 +337,224 @@ public class AgentRecordUpsertService {
                 return mapped;
             }
         }
-        ActiveWindowActivity byUuid = windowRepository.findByOfflineId(source.getRecordUuid())
+        return windowRepository.findByOfflineId(source.getRecordUuid())
                 .filter(row -> row.getDevice() != null
                         && device.getId().equals(row.getDevice().getId()))
                 .orElse(null);
-        if (byUuid != null) {
-            return byUuid;
-        }
-        if (source.getStartedAt() != null && source.getWindowTitle() != null) {
-            var naturalMatches = windowRepository
-                    .findByDeviceIdAndStartTimeAndWindowTitleOrderByIdDesc(
-                            device.getId(), source.getStartedAt(), source.getWindowTitle());
-            if (!naturalMatches.isEmpty()) {
-                return naturalMatches.getFirst();
-            }
-        }
-        return new ActiveWindowActivity();
     }
 
     private Long projectIdle(AgentActivity source, Device device, User user) {
-        IdleActivity target = existingIdleTarget(source, device);
+        String naturalKey = ActivityNaturalKey.of(source);
+        IdleActivity target = mappedIdle(source, device);
+        if (target == null) {
+            target = idleRepository
+                    .findFirstByDeviceIdAndIdleStartAndIdleEndIsNullOrderByIdDesc(
+                            device.getId(), source.getStartedAt())
+                    .orElse(null);
+        }
+        if (target == null) {
+            target = idleRepository
+                    .findByDeviceIdAndIdleStartOrderByIdDesc(device.getId(), source.getStartedAt())
+                    .stream().findFirst().orElse(null);
+        }
+        if (target == null) {
+            target = idleRepository
+                    .findFirstByDeviceIdAndNaturalKeyOrderByIdDesc(device.getId(), naturalKey)
+                    .orElseGet(IdleActivity::new);
+        }
+
+        if (source.getState() == ActivityState.OPEN
+                && target.getId() != null
+                && target.getIdleEnd() != null) {
+            return target.getId();
+        }
+        if (source.getState() == ActivityState.OPEN) {
+            closeOtherRunningIdle(device.getId(), target.getId(), source.getStartedAt());
+        }
+
         target.setIdleStart(source.getStartedAt());
         target.setIdleEnd(source.getEndedAt());
         target.setIdleSeconds(seconds(source.getDurationMillis()));
         target.setStatus(legacyStatus(source));
+        target.setNaturalKey(naturalKey);
         target.setDevice(device);
         target.setUser(user);
         return idleRepository.save(target).getId();
     }
 
-    private IdleActivity existingIdleTarget(AgentActivity source, Device device) {
-        if (source.getLegacyRecordId() != null) {
-            IdleActivity mapped = idleRepository.findById(source.getLegacyRecordId())
-                    .filter(row -> row.getDevice() != null
-                            && device.getId().equals(row.getDevice().getId()))
-                    .orElse(null);
-            if (mapped != null) {
-                return mapped;
-            }
+    private IdleActivity mappedIdle(AgentActivity source, Device device) {
+        if (source.getLegacyRecordId() == null) {
+            return null;
         }
-        if (source.getStartedAt() != null) {
-            var naturalMatches = idleRepository.findByDeviceIdAndIdleStartOrderByIdDesc(
-                    device.getId(), source.getStartedAt());
-            if (!naturalMatches.isEmpty()) {
-                return naturalMatches.getFirst();
-            }
-        }
-        return new IdleActivity();
+        return idleRepository.findById(source.getLegacyRecordId())
+                .filter(row -> row.getDevice() != null
+                        && device.getId().equals(row.getDevice().getId()))
+                .orElse(null);
     }
 
     private Long projectSession(AgentActivity source, Device device, User user) {
-        DeviceSession target = existingSessionTarget(source, device);
+        String naturalKey = ActivityNaturalKey.of(source);
+        DeviceSession target = mappedSession(source, device);
+        if (target == null) {
+            target = sessionRepository
+                    .findFirstByDeviceIdAndStartupTimeAndShutdownTimeIsNullOrderByIdDesc(
+                            device.getId(), source.getStartedAt())
+                    .orElse(null);
+        }
+        if (target == null) {
+            target = sessionRepository
+                    .findByDeviceIdAndStartupTimeOrderByIdDesc(device.getId(), source.getStartedAt())
+                    .stream().findFirst().orElse(null);
+        }
+        if (target == null) {
+            target = sessionRepository
+                    .findFirstByDeviceIdAndNaturalKeyOrderByIdDesc(device.getId(), naturalKey)
+                    .orElseGet(DeviceSession::new);
+        }
+
+        if (source.getState() == ActivityState.OPEN
+                && target.getId() != null
+                && target.getShutdownTime() != null) {
+            return target.getId();
+        }
+        boolean newProjection = target.getId() == null;
+        if (source.getState() == ActivityState.OPEN && newProjection) {
+            closePreviousRunningAtRestart(
+                    device.getId(), null, source.getStartedAt());
+        }
+
         target.setStartupTime(source.getStartedAt());
         target.setShutdownTime(source.getEndedAt());
         target.setSessionDurationSeconds(seconds(source.getDurationMillis()));
         target.setStatus(legacyStatus(source));
+        target.setNaturalKey(naturalKey);
         target.setDevice(device);
         target.setUser(user);
         return sessionRepository.save(target).getId();
     }
 
-    private DeviceSession existingSessionTarget(AgentActivity source, Device device) {
-        if (source.getLegacyRecordId() != null) {
-            DeviceSession mapped = sessionRepository.findById(source.getLegacyRecordId())
-                    .filter(row -> row.getDevice() != null
-                            && device.getId().equals(row.getDevice().getId()))
-                    .orElse(null);
-            if (mapped != null) {
-                return mapped;
-            }
+    private DeviceSession mappedSession(AgentActivity source, Device device) {
+        if (source.getLegacyRecordId() == null) {
+            return null;
         }
-        if (source.getStartedAt() != null) {
-            var naturalMatches = sessionRepository.findByDeviceIdAndStartupTimeOrderByIdDesc(
-                    device.getId(), source.getStartedAt());
-            if (!naturalMatches.isEmpty()) {
-                return naturalMatches.getFirst();
+        return sessionRepository.findById(source.getLegacyRecordId())
+                .filter(row -> row.getDevice() != null
+                        && device.getId().equals(row.getDevice().getId()))
+                .orElse(null);
+    }
+
+    private void closeOtherRunningProcesses(
+            Long deviceId, Long pid, Long keepId, LocalDateTime newStart) {
+        for (ProcessActivity row : processRepository
+                .findByDeviceIdAndPidAndStatusOrderByStartTimeAscIdAsc(
+                        deviceId, pid, "RUNNING")) {
+            if (Objects.equals(row.getId(), keepId)) {
+                continue;
             }
+            closeProcess(row, newStart, "CLOSED");
         }
-        return new DeviceSession();
+    }
+
+    private void closeOtherRunningWindows(
+            Long deviceId, Long keepId, LocalDateTime newStart) {
+        for (ActiveWindowActivity row : windowRepository.findByDeviceIdAndStatus(deviceId, "RUNNING")) {
+            if (Objects.equals(row.getId(), keepId)) {
+                continue;
+            }
+            closeWindow(row, newStart, "CLOSED");
+        }
+    }
+
+    private void closeOtherRunningIdle(Long deviceId, Long keepId, LocalDateTime newStart) {
+        for (IdleActivity row : idleRepository.findByDeviceIdAndStatus(deviceId, "RUNNING")) {
+            if (Objects.equals(row.getId(), keepId)) {
+                continue;
+            }
+            closeIdle(row, newStart, "CLOSED");
+        }
+    }
+
+    private void closePreviousRunningAtRestart(
+            Long deviceId, Long keepSessionId, LocalDateTime restartAt) {
+        for (ProcessActivity row : processRepository.findByDeviceIdAndStatus(deviceId, "RUNNING")) {
+            closeProcess(row, restartAt, "CLOSED");
+        }
+        for (ActiveWindowActivity row : windowRepository.findByDeviceIdAndStatus(deviceId, "RUNNING")) {
+            closeWindow(row, restartAt, "CLOSED");
+        }
+        for (IdleActivity row : idleRepository.findByDeviceIdAndStatus(deviceId, "RUNNING")) {
+            closeIdle(row, restartAt, "CLOSED");
+        }
+        for (DeviceSession row : sessionRepository.findByDeviceIdAndStatus(deviceId, "RUNNING")) {
+            if (Objects.equals(row.getId(), keepSessionId)) {
+                continue;
+            }
+            closeSession(row, restartAt, "SHUTDOWN");
+        }
+    }
+
+    private void closeProcess(ProcessActivity row, LocalDateTime end, String status) {
+        LocalDateTime safeEnd = safeEnd(row.getStartTime(), end);
+        row.setEndTime(safeEnd);
+        row.setDurationSeconds(durationSeconds(row.getStartTime(), safeEnd));
+        row.setStatus(status);
+        processRepository.save(row);
+    }
+
+    private void closeWindow(ActiveWindowActivity row, LocalDateTime end, String status) {
+        LocalDateTime safeEnd = safeEnd(row.getStartTime(), end);
+        row.setEndTime(safeEnd);
+        row.setDurationSeconds(durationSeconds(row.getStartTime(), safeEnd));
+        row.setStatus(status);
+        windowRepository.save(row);
+    }
+
+    private void closeIdle(IdleActivity row, LocalDateTime end, String status) {
+        LocalDateTime safeEnd = safeEnd(row.getIdleStart(), end);
+        row.setIdleEnd(safeEnd);
+        row.setIdleSeconds(durationSeconds(row.getIdleStart(), safeEnd));
+        row.setStatus(status);
+        idleRepository.save(row);
+    }
+
+    private void closeSession(DeviceSession row, LocalDateTime end, String status) {
+        LocalDateTime safeEnd = safeEnd(row.getStartupTime(), end);
+        row.setShutdownTime(safeEnd);
+        row.setSessionDurationSeconds(durationSeconds(row.getStartupTime(), safeEnd));
+        row.setStatus(status);
+        sessionRepository.save(row);
     }
 
     private static void validate(ActivitySnapshotRequest request) {
         if (request.state() == ActivityState.OPEN && request.endedAt() != null) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "OPEN records cannot have an end time");
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "OPEN records cannot have an end time");
         }
         if (request.state() != ActivityState.OPEN && request.endedAt() == null) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Closed records require an end time");
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "Closed records require an end time");
         }
         if (request.endedAt() != null && request.endedAt().isBefore(request.startedAt())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "End time is before start time");
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "End time is before start time");
         }
-        if ((request.kind() == ActivityKind.PROCESS || request.kind() == ActivityKind.ACTIVE_WINDOW)
-                && (request.processName() == null || request.processName().isBlank())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Process name is required");
+        if ((request.kind() == ActivityKind.PROCESS
+                || request.kind() == ActivityKind.ACTIVE_WINDOW)
+                && (request.processId() == null
+                    || request.processName() == null
+                    || request.processName().isBlank())) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "PID and process name are required");
         }
         if (request.kind() == ActivityKind.ACTIVE_WINDOW
                 && (request.windowTitle() == null || request.windowTitle().isBlank())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Window title is required");
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "Window title is required");
         }
     }
 
-    private static ActivityAcknowledgement acknowledgement(AgentActivity activity, String status) {
+    private static ActivityAcknowledgement acknowledgement(
+            AgentActivity activity, String status) {
         return new ActivityAcknowledgement(
                 activity.getRecordUuid(), activity.getRevision(), status, null);
     }
@@ -436,27 +572,40 @@ public class AgentRecordUpsertService {
     }
 
     private static Long seconds(Long durationMillis) {
-        return durationMillis == null ? null : durationMillis / 1000L;
+        return durationMillis == null ? null : Math.max(0L, durationMillis / 1000L);
     }
 
     private static String legacyStatus(AgentActivity activity) {
         if (activity.getState() == ActivityState.OPEN) {
             return "RUNNING";
         }
-        if (activity.getState() == ActivityState.INFERRED) {
-            return "INTERRUPTED";
-        }
         if (activity.getKind() == ActivityKind.DEVICE_SESSION) {
             String reason = activity.getCloseReason() == null
                     ? ""
                     : activity.getCloseReason().trim().toUpperCase();
             return switch (reason) {
-                case "SYSTEM_SHUTDOWN", "SYSTEM_RESTART" -> "SHUTDOWN";
+                case "SYSTEM_SHUTDOWN", "SYSTEM_RESTART", "CRASH_RECOVERY" -> "SHUTDOWN";
                 case "USER_LOGOFF" -> "LOGOFF";
                 case "AGENT_STOP" -> "STOPPED";
                 default -> "CLOSED";
             };
         }
+        // Inferred recovery is a closed record with an inferred close reason. It is not
+        // a separate online/offline status and must not appear as INTERRUPTED.
         return "CLOSED";
+    }
+
+    private static LocalDateTime safeEnd(LocalDateTime start, LocalDateTime requestedEnd) {
+        if (requestedEnd == null) {
+            return null;
+        }
+        return start != null && requestedEnd.isBefore(start) ? start : requestedEnd;
+    }
+
+    private static Long durationSeconds(LocalDateTime start, LocalDateTime end) {
+        if (start == null || end == null) {
+            return null;
+        }
+        return Math.max(0L, Duration.between(start, end).toSeconds());
     }
 }

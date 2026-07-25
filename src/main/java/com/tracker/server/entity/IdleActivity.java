@@ -2,6 +2,7 @@ package com.tracker.server.entity;
 
 import java.time.LocalDateTime;
 
+import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
@@ -35,6 +36,9 @@ public class IdleActivity {
     private Long idleSeconds;
 
     private String status;
+
+    @Column(name = "natural_key", length = 64)
+    private String naturalKey;
 
     @ManyToOne
     @JoinColumn(name = "device_id")

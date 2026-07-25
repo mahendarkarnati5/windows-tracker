@@ -2,8 +2,6 @@ package com.tracker.server.controller;
 
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.PutMapping;
-import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -11,7 +9,6 @@ import org.springframework.web.bind.annotation.RestController;
 import com.tracker.server.dto.AdminLoginRequest;
 import com.tracker.server.dto.LoginRequest;
 import com.tracker.server.dto.LoginResponse;
-import com.tracker.server.dto.PasswordResetRequest;
 import com.tracker.server.dto.RegisterRequest;
 import com.tracker.server.service.AuthService;
 
@@ -58,13 +55,7 @@ public class AuthController {
         return authService.adminLogin(request);
     }
 
-    @PutMapping("/admin/users/{userId}/password")
-    public ResponseEntity<Void> resetPassword(
-            @PathVariable Long userId,
-            @Valid @RequestBody PasswordResetRequest request) {
-        authService.resetPassword(userId, request);
-        return ResponseEntity.noContent().build();
-    }
+
     
     
 }

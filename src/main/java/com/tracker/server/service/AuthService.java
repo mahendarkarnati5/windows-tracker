@@ -2,14 +2,12 @@ package com.tracker.server.service;
 
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.server.ResponseStatusException;
 
 import com.tracker.server.dto.AdminLoginRequest;
 import com.tracker.server.dto.LoginRequest;
 import com.tracker.server.dto.LoginResponse;
-import com.tracker.server.dto.PasswordResetRequest;
 import com.tracker.server.dto.RegisterRequest;
 import com.tracker.server.entity.User;
 import com.tracker.server.repository.UserRepository;
@@ -36,7 +34,6 @@ public class AuthService {
 
         User user = User.builder()
                 .username(username)
-//                .password(passwordEncoder.encode(request.getPassword()))
                 .role("USER")
                 .build();
 
@@ -77,12 +74,10 @@ public class AuthService {
         User user = userRepository.findByUsername(request.getUsername().trim())
                 .orElseThrow(() -> new ResponseStatusException(
                         HttpStatus.UNAUTHORIZED, "Invalid credentials"));
-
-//        if (user.getPassword() == null
-//                || !passwordEncoder.matches(request.getPassword(), user.getPassword())) {
-//            throw new ResponseStatusException(
-//                    HttpStatus.UNAUTHORIZED, "Invalid credentials");
-//        }
+        if (!"USER".equalsIgnoreCase(user.getRole())) {
+            throw new ResponseStatusException(
+                    HttpStatus.UNAUTHORIZED, "Invalid credentials");
+        }
 
         String token =
                 jwtUtil.generateToken(
@@ -131,12 +126,5 @@ public class AuthService {
                 .build();
     }
 
-    @Transactional
-    public void resetPassword(Long userId, PasswordResetRequest request) {
-        User user = userRepository.findById(userId)
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND, "User not found"));
-        user.setPassword(passwordEncoder.encode(request.password()));
-        userRepository.save(user);
-    }
+
 }

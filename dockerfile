@@ -3,7 +3,7 @@ WORKDIR /app
 COPY pom.xml .
 RUN mvn -q -DskipTests dependency:go-offline
 COPY . .
-RUN mvn clean package -DskipTests
+RUN mvn clean verify
 
 FROM eclipse-temurin:21-jre
 WORKDIR /app

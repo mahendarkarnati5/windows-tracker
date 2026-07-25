@@ -15,18 +15,12 @@ services:
       - key: JWT_SECRET
         sync: false
       - key: JWT_EXPIRE
-        sync: false
-      - key: ADMIN_BOOTSTRAP_USERNAME
-        sync: false
-      - key: ADMIN_BOOTSTRAP_PASSWORD
-        sync: false
-      - key: FLYWAY_ENABLED
-        value: false
+        value: 86400000
       - key: DB_POOL_MAX_SIZE
-        value: 5
+        value: 10
       - key: DB_POOL_MIN_IDLE
-        value: 0
-      - key: DB_INITIALIZATION_FAIL_TIMEOUT_MS
-        value: -1
-      - key: AGENT_DUPLICATE_REPAIR_ENABLED
-        value: false
+        value: 1
+      - key: AGENT_OFFLINE_AFTER_SECONDS
+        value: 45
+      - key: AGENT_PRESENCE_CHECK_MS
+        value: 15000

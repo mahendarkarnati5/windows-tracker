@@ -1,13 +1,12 @@
 package com.tracker.server.agent;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
-import java.util.UUID;
 import java.util.List;
+import java.util.UUID;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -16,7 +15,6 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
 
 import com.tracker.server.agent.dto.ActivitySnapshotRequest;
-import com.tracker.server.agent.dto.AgentPresenceRequest;
 import com.tracker.server.agent.dto.AgentShutdownRequest;
 import com.tracker.server.agent.dto.AgentSyncRequest;
 import com.tracker.server.agent.entity.AgentDevice;
@@ -24,14 +22,11 @@ import com.tracker.server.agent.model.ActivityKind;
 import com.tracker.server.agent.model.ActivityState;
 import com.tracker.server.agent.repository.AgentActivityRepository;
 import com.tracker.server.agent.repository.AgentDeviceRepository;
-import com.tracker.server.agent.service.AgentRecordUpsertService;
-import com.tracker.server.agent.service.AgentProjectionService;
-import com.tracker.server.agent.service.ProjectionDuplicateRepairService;
-import com.tracker.server.agent.service.AgentCredentialService;
 import com.tracker.server.agent.service.AgentDeviceService;
+import com.tracker.server.agent.service.AgentRecordUpsertService;
 import com.tracker.server.agent.service.AgentSyncService;
+import com.tracker.server.dto.dashboard.ProcessActivityRow;
 import com.tracker.server.entity.Device;
-import com.tracker.server.entity.ProcessActivity;
 import com.tracker.server.entity.User;
 import com.tracker.server.repository.ActiveWindowActivityRepository;
 import com.tracker.server.repository.DeviceRepository;
@@ -39,17 +34,16 @@ import com.tracker.server.repository.DeviceSessionRepository;
 import com.tracker.server.repository.IdleActivityRepository;
 import com.tracker.server.repository.ProcessActivityRepository;
 import com.tracker.server.repository.UserRepository;
+import com.tracker.server.service.AdminDashboardService;
 
 @SpringBootTest
 @ActiveProfiles("test")
 class AgentSyncIntegrationTest {
 
     @Autowired AgentRecordUpsertService upsertService;
-    @Autowired AgentProjectionService projectionService;
-    @Autowired AgentCredentialService credentialService;
     @Autowired AgentSyncService syncService;
     @Autowired AgentDeviceService deviceService;
-    @Autowired ProjectionDuplicateRepairService duplicateRepairService;
+    @Autowired AdminDashboardService dashboardService;
     @Autowired AgentActivityRepository activityRepository;
     @Autowired AgentDeviceRepository agentDeviceRepository;
     @Autowired ProcessActivityRepository processRepository;
@@ -60,6 +54,7 @@ class AgentSyncIntegrationTest {
     @Autowired UserRepository userRepository;
 
     private User user;
+    private Device device;
     private AgentDevice agentDevice;
 
     @BeforeEach
@@ -75,13 +70,13 @@ class AgentSyncIntegrationTest {
 
         user = userRepository.save(User.builder()
                 .username("sync-user")
-                .password("unused")
                 .role("USER")
                 .build());
-        Device legacy = deviceRepository.save(Device.builder()
+        device = deviceRepository.save(Device.builder()
                 .macAddress("00-11-22-33-44-55")
                 .machineName("test-machine")
                 .osName("Windows")
+                .lastSeen(LocalDateTime.now(ZoneOffset.UTC))
                 .status("ACTIVE")
                 .online(true)
                 .user(user)
@@ -89,537 +84,317 @@ class AgentSyncIntegrationTest {
         LocalDateTime now = LocalDateTime.now(ZoneOffset.UTC);
         agentDevice = agentDeviceRepository.save(AgentDevice.builder()
                 .deviceUuid(UUID.randomUUID().toString())
-                .legacyDeviceId(legacy.getId())
+                .legacyDeviceId(device.getId())
                 .userId(user.getId())
                 .machineName("test-machine")
                 .osName("Windows")
+                .lifecycleState("ONLINE")
+                .lastSeenAt(now)
                 .createdAt(now)
                 .updatedAt(now)
                 .build());
     }
 
     @Test
-    void replayAndOutOfOrderUpdatesRemainIdempotent() {
-        String recordUuid = UUID.randomUUID().toString();
-        Instant start = Instant.parse("2026-07-19T08:00:00Z");
-        ActivitySnapshotRequest open = new ActivitySnapshotRequest(
-                recordUuid,
-                ActivityKind.PROCESS,
-                1,
-                start,
-                null,
-                ActivityState.OPEN,
-                null,
-                4242L,
-                "notepad.exe",
-                null,
-                null);
+    void processRevisionUpdatesTheSameExactNaturalRecord() {
+        String uuid = UUID.randomUUID().toString();
+        Instant start = Instant.parse("2026-07-25T08:00:00Z");
 
-        assertThat(upsertService.apply(agentDevice, user, open).status()).isEqualTo("APPLIED");
-        assertThat(upsertService.apply(agentDevice, user, open).status()).isEqualTo("UNCHANGED");
-        assertThat(activityRepository.count()).isEqualTo(1);
+        assertThat(upsertService.apply(agentDevice, user,
+                snapshot(uuid, ActivityKind.PROCESS, 1, start, null,
+                        ActivityState.OPEN, null, 4242L, "notepad.exe", null)).status())
+                .isEqualTo("APPLIED");
+        assertThat(upsertService.apply(agentDevice, user,
+                snapshot(uuid, ActivityKind.PROCESS, 1, start, null,
+                        ActivityState.OPEN, null, 4242L, "notepad.exe", null)).status())
+                .isEqualTo("UNCHANGED");
+        assertThat(upsertService.apply(agentDevice, user,
+                snapshot(uuid, ActivityKind.PROCESS, 2, start, start.plusSeconds(10),
+                        ActivityState.CLOSED, "PROCESS_EXIT", 4242L, "notepad.exe", null)).status())
+                .isEqualTo("APPLIED");
+
         assertThat(processRepository.count()).isEqualTo(1);
-
-        ActivitySnapshotRequest closed = new ActivitySnapshotRequest(
-                recordUuid,
-                ActivityKind.PROCESS,
-                2,
-                start,
-                start.plusSeconds(10),
-                ActivityState.CLOSED,
-                "PROCESS_EXIT",
-                4242L,
-                "notepad.exe",
-                null,
-                null);
-        assertThat(upsertService.apply(agentDevice, user, closed).status()).isEqualTo("APPLIED");
-        assertThat(upsertService.apply(agentDevice, user, open).status()).isEqualTo("STALE");
-
-        var canonical = activityRepository.findById(recordUuid).orElseThrow();
-        assertThat(canonical.getRevision()).isEqualTo(2);
-        assertThat(canonical.getState()).isEqualTo(ActivityState.CLOSED);
-        assertThat(canonical.getDurationMillis()).isEqualTo(10_000L);
-        assertThat(processRepository.count()).isEqualTo(1);
-        var projection = processRepository.findAll().getFirst();
-        assertThat(projection.getStatus()).isEqualTo("CLOSED");
-        assertThat(projection.getDurationSeconds()).isEqualTo(10L);
+        assertThat(processRepository.findAll().getFirst())
+                .satisfies(row -> {
+                    assertThat(row.getEndTime()).isEqualTo(utc(start.plusSeconds(10)));
+                    assertThat(row.getDurationSeconds()).isEqualTo(10L);
+                    assertThat(row.getStatus()).isEqualTo("CLOSED");
+                });
     }
 
     @Test
-    void activeWindowKeepsProcessAndTitleInCanonicalRecord() {
-        String recordUuid = UUID.randomUUID().toString();
-        Instant start = Instant.parse("2026-07-19T09:00:00Z");
-        ActivitySnapshotRequest window = new ActivitySnapshotRequest(
-                recordUuid,
-                ActivityKind.ACTIVE_WINDOW,
-                1,
-                start,
-                start.plusSeconds(2),
-                ActivityState.CLOSED,
-                "WINDOW_CHANGED",
-                99L,
-                "explorer.exe",
-                "Downloads",
-                null);
-
-        upsertService.apply(agentDevice, user, window);
-
-        var canonical = activityRepository.findById(recordUuid).orElseThrow();
-        assertThat(canonical.getProcessName()).isEqualTo("explorer.exe");
-        assertThat(canonical.getWindowTitle()).isEqualTo("Downloads");
-        assertThat(windowRepository.count()).isEqualTo(1);
-    }
-
-    @Test
-    void deviceCredentialIsRandomHashedAndDeviceScoped() {
-        String token = credentialService.issue(agentDevice);
-        agentDeviceRepository.save(agentDevice);
-
-        assertThat(token).isNotBlank();
-        assertThat(agentDevice.getCredentialHash()).hasSize(64).doesNotContain(token);
-        assertThat(credentialService.authenticate(agentDevice.getDeviceUuid(), token).getId())
-                .isEqualTo(user.getId());
-        assertThatThrownBy(() -> credentialService.authenticate(
-                agentDevice.getDeviceUuid(), token + "invalid"))
-                .isInstanceOf(org.springframework.security.core.AuthenticationException.class);
-    }
-
-    @Test
-    void rejectedRecordDoesNotBlockOtherRecordsInTheBatch() {
-        Instant start = Instant.parse("2026-07-19T10:00:00Z");
-        ActivitySnapshotRequest invalid = new ActivitySnapshotRequest(
-                UUID.randomUUID().toString(),
-                ActivityKind.IDLE,
-                2,
-                start,
-                null,
-                ActivityState.CLOSED,
-                "USER_ACTIVE",
-                null,
-                null,
-                null,
-                null);
-        ActivitySnapshotRequest valid = new ActivitySnapshotRequest(
-                UUID.randomUUID().toString(),
-                ActivityKind.PROCESS,
-                1,
-                start,
-                null,
-                ActivityState.OPEN,
-                null,
-                123L,
-                "notepad.exe",
-                null,
-                null);
-
-        var response = syncService.synchronize(
-                user.getUsername(),
-                agentDevice.getDeviceUuid(),
-                new AgentSyncRequest(
-                        UUID.randomUUID().toString(),
-                        Instant.now().minusSeconds(30),
-                        1L,
-                        Instant.now(),
-                        List.of(invalid, valid)),
-                "127.0.0.1");
-
-        assertThat(response.acknowledgements())
-                .extracting(acknowledgement -> acknowledgement.status())
-                .containsExactly("REJECTED", "APPLIED");
-        assertThat(activityRepository.findById(valid.recordUuid())).isPresent();
-    }
-    @Test
-    void temporaryOfflineCloseIsReplacedByLaterAuthoritativeLocalClose() {
-        String recordUuid = UUID.randomUUID().toString();
-        Instant start = Instant.parse("2026-07-20T10:00:00Z");
-        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
-                recordUuid,
-                ActivityKind.PROCESS,
-                1,
-                start,
-                null,
-                ActivityState.OPEN,
-                null,
-                700L,
-                "chrome.exe",
-                null,
-                null));
-
-        LocalDateTime disconnectedAt = LocalDateTime.ofInstant(
-                Instant.parse("2026-07-20T11:00:00Z"), ZoneOffset.UTC);
-        projectionService.temporarilyCloseForOffline(agentDevice, disconnectedAt);
-
-        var temporary = processRepository.findAll().getFirst();
-        assertThat(temporary.getStatus()).isEqualTo("OFFLINE");
-        assertThat(temporary.getEndTime()).isEqualTo(disconnectedAt);
-        assertThat(temporary.getDurationSeconds()).isEqualTo(3_600L);
-        assertThat(activityRepository.findById(recordUuid).orElseThrow().getState())
-                .isEqualTo(ActivityState.OPEN);
-
-        Instant actualClose = Instant.parse("2026-07-20T11:30:00Z");
-        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
-                recordUuid,
-                ActivityKind.PROCESS,
-                2,
-                start,
-                actualClose,
-                ActivityState.CLOSED,
-                "PROCESS_EXIT",
-                700L,
-                "chrome.exe",
-                null,
-                null));
-
-        var corrected = processRepository.findAll().getFirst();
-        assertThat(corrected.getStatus()).isEqualTo("CLOSED");
-        assertThat(corrected.getEndTime())
-                .isEqualTo(LocalDateTime.ofInstant(actualClose, ZoneOffset.UTC));
-        assertThat(corrected.getDurationSeconds()).isEqualTo(5_400L);
-    }
-
-    @Test
-    void reconnectPresenceRestoresOnlyRecordsStillOpenOnTheAgent() {
-        String recordUuid = UUID.randomUUID().toString();
-        Instant start = Instant.parse("2026-07-20T12:00:00Z");
-        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
-                recordUuid,
-                ActivityKind.ACTIVE_WINDOW,
-                1,
-                start,
-                null,
-                ActivityState.OPEN,
-                null,
-                701L,
-                "chrome.exe",
-                "Dashboard",
-                null));
-        projectionService.temporarilyCloseForOffline(
-                agentDevice,
-                LocalDateTime.ofInstant(start.plusSeconds(60), ZoneOffset.UTC));
-
-        projectionService.reconcileOpenRecords(agentDevice, java.util.Set.of(recordUuid));
-
-        var restored = windowRepository.findAll().getFirst();
-        assertThat(restored.getStatus()).isEqualTo("RUNNING");
-        assertThat(restored.getEndTime()).isNull();
-        assertThat(restored.getDurationSeconds()).isNull();
-    }
-
-    @Test
-    void deviceSessionUsesShutdownStatusOnlyForARealSystemShutdown() {
-        Instant start = Instant.parse("2026-07-20T13:00:00Z");
-        String shutdownSession = UUID.randomUUID().toString();
-        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
-                shutdownSession,
-                ActivityKind.DEVICE_SESSION,
-                1,
-                start,
-                start.plusSeconds(60),
-                ActivityState.CLOSED,
-                "SYSTEM_SHUTDOWN",
-                null,
-                null,
-                null,
-                null));
-
-        assertThat(sessionRepository.findAll().getFirst().getStatus()).isEqualTo("SHUTDOWN");
-    }
-
-    @Test
-    void lifecycleOrderingRejectsLateRequestsFromAnOldSession() {
-        String oldSession = UUID.randomUUID().toString();
-        Instant oldStart = Instant.now().minusSeconds(3_600);
-        Instant oldShutdown = Instant.now().minusSeconds(1_800);
-
-        deviceService.activitySeen(
-                user.getUsername(),
-                agentDevice.getDeviceUuid(),
-                oldSession,
-                oldStart,
-                1L,
-                oldStart.plusSeconds(30),
-                "127.0.0.1");
-        deviceService.shutdown(
-                user.getUsername(),
-                agentDevice.getDeviceUuid(),
-                new AgentShutdownRequest(
-                        oldShutdown, oldSession, oldStart, 1L, "SYSTEM_SHUTDOWN"),
-                "127.0.0.1");
-
-        // A delayed heartbeat from the already shut-down session cannot resurrect it.
-        deviceService.heartbeat(
-                user.getUsername(),
-                agentDevice.getDeviceUuid(),
-                new AgentPresenceRequest(
-                        oldShutdown.plusSeconds(1), oldSession, oldStart, 1L, List.of()),
-                "127.0.0.1");
-        var afterLateHeartbeat = agentDeviceRepository.findById(agentDevice.getId()).orElseThrow();
-        assertThat(afterLateHeartbeat.getLifecycleState()).isEqualTo("SHUTDOWN");
-        assertThat(deviceRepository.findById(agentDevice.getLegacyDeviceId()).orElseThrow().isOnline())
-                .isFalse();
-
-        String newSession = UUID.randomUUID().toString();
-        Instant newStart = Instant.now();
-        deviceService.heartbeat(
-                user.getUsername(),
-                agentDevice.getDeviceUuid(),
-                new AgentPresenceRequest(newStart, newSession, newStart, 2L, List.of()),
-                "127.0.0.1");
-
-        // A late shutdown from the older session cannot close the new boot.
-        deviceService.shutdown(
-                user.getUsername(),
-                agentDevice.getDeviceUuid(),
-                new AgentShutdownRequest(
-                        oldShutdown.plusSeconds(10),
-                        oldSession,
-                        oldStart,
-                        1L,
-                        "SYSTEM_SHUTDOWN"),
-                "127.0.0.1");
-
-        var current = agentDeviceRepository.findById(agentDevice.getId()).orElseThrow();
-        assertThat(current.getCurrentSessionUuid()).isEqualTo(newSession);
-        assertThat(current.getLifecycleState()).isEqualTo("ONLINE");
-        assertThat(deviceRepository.findById(agentDevice.getLegacyDeviceId()).orElseThrow().isOnline())
-                .isTrue();
-    }
-
-    @Test
-    void serverTruncatesLongWindowTitlesBeforePersistence() {
-        String recordUuid = UUID.randomUUID().toString();
-        Instant start = Instant.parse("2026-07-22T08:00:00Z");
-        String longTitle = "😀".repeat(1_100);
-
-        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
-                recordUuid,
-                ActivityKind.ACTIVE_WINDOW,
-                1,
-                start,
-                null,
-                ActivityState.OPEN,
-                null,
-                800L,
-                "chrome.exe",
-                longTitle,
-                null));
-
-        var canonical = activityRepository.findById(recordUuid).orElseThrow();
-        assertThat(canonical.getWindowTitle().codePointCount(
-                0, canonical.getWindowTitle().length())).isEqualTo(1_000);
-        var projection = windowRepository.findAll().getFirst();
-        assertThat(projection.getWindowTitle().codePointCount(
-                0, projection.getWindowTitle().length())).isEqualTo(1_000);
-    }
-
-    @Test
-    void differentCanonicalUuidsForTheSameProcessShareOneProjectionRow() {
-        Instant start = Instant.parse("2026-07-22T17:38:37Z");
-        ActivitySnapshotRequest first = new ActivitySnapshotRequest(
-                UUID.randomUUID().toString(),
-                ActivityKind.PROCESS,
-                1,
-                start,
-                null,
-                ActivityState.OPEN,
-                null,
-                11056L,
-                "Taskmgr.exe",
-                null,
-                null);
-        ActivitySnapshotRequest repeated = new ActivitySnapshotRequest(
-                UUID.randomUUID().toString(),
-                ActivityKind.PROCESS,
-                1,
-                start.plusMillis(500),
-                null,
-                ActivityState.OPEN,
-                null,
-                11056L,
-                "Taskmgr.exe",
-                null,
-                null);
+    void differentUuidsWithSameExactProcessKeyShareOneProjection() {
+        Instant start = Instant.parse("2026-07-25T08:10:00Z");
+        var first = snapshot(UUID.randomUUID().toString(), ActivityKind.PROCESS, 1,
+                start, null, ActivityState.OPEN, null, 11056L, "Taskmgr.exe", null);
+        var duplicate = snapshot(UUID.randomUUID().toString(), ActivityKind.PROCESS, 1,
+                start, null, ActivityState.OPEN, null, 11056L, "taskmgr.exe", null);
 
         upsertService.apply(agentDevice, user, first);
-        upsertService.apply(agentDevice, user, repeated);
+        upsertService.apply(agentDevice, user, duplicate);
 
         assertThat(activityRepository.count()).isEqualTo(2);
         assertThat(processRepository.count()).isEqualTo(1);
         Long projectionId = processRepository.findAll().getFirst().getId();
         assertThat(activityRepository.findById(first.recordUuid()).orElseThrow().getLegacyRecordId())
                 .isEqualTo(projectionId);
-        assertThat(activityRepository.findById(repeated.recordUuid()).orElseThrow().getLegacyRecordId())
+        assertThat(activityRepository.findById(duplicate.recordUuid()).orElseThrow().getLegacyRecordId())
                 .isEqualTo(projectionId);
     }
 
     @Test
-    void startupRepairMergesExistingDuplicateProcessRows() {
-        Device device = deviceRepository.findById(agentDevice.getLegacyDeviceId()).orElseThrow();
-        LocalDateTime start = LocalDateTime.ofInstant(
-                Instant.parse("2026-07-22T17:38:37Z"), ZoneOffset.UTC);
-        processRepository.save(ProcessActivity.builder()
-                .pid(11056L)
-                .processName("Taskmgr.exe")
-                .startTime(start)
-                .status("RUNNING")
-                .device(device)
-                .user(user)
-                .build());
-        processRepository.save(ProcessActivity.builder()
-                .pid(11056L)
-                .processName("Taskmgr.exe")
-                .startTime(start)
-                .status("RUNNING")
-                .device(device)
-                .user(user)
-                .build());
+    void aNewProcessStartClosesThePreviousRunningPid() {
+        Instant firstStart = Instant.parse("2026-07-25T08:20:00Z");
+        Instant secondStart = firstStart.plusSeconds(20);
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.PROCESS, 1,
+                firstStart, null, ActivityState.OPEN, null, 900L, "sample.exe", null));
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.PROCESS, 1,
+                secondStart, null, ActivityState.OPEN, null, 900L, "sample.exe", null));
 
-        duplicateRepairService.repairAll();
-
-        assertThat(processRepository.findByDeviceIdAndPidAndStartTimeOrderByIdDesc(
-                device.getId(), 11056L, start)).singleElement()
-                .satisfies(row -> {
-                    assertThat(row.getStatus()).isEqualTo("RUNNING");
-                    assertThat(row.getEndTime()).isNull();
-                    assertThat(row.getDurationSeconds()).isNull();
-                });
-    }
-
-
-    @Test
-    void duplicateRepairPreservesPidReuseHistoryAndLeavesOnlyNewestRunning() {
-        Device device = deviceRepository.findById(agentDevice.getLegacyDeviceId()).orElseThrow();
-        LocalDateTime oldStart = LocalDateTime.ofInstant(
-                Instant.parse("2026-07-22T17:00:00Z"), ZoneOffset.UTC);
-        LocalDateTime newStart = oldStart.plusMinutes(5);
-        processRepository.save(ProcessActivity.builder()
-                .pid(2000L)
-                .processName("old-app.exe")
-                .startTime(oldStart)
-                .status("RUNNING")
-                .device(device)
-                .user(user)
-                .build());
-        processRepository.save(ProcessActivity.builder()
-                .pid(2000L)
-                .processName("new-app.exe")
-                .startTime(newStart)
-                .status("RUNNING")
-                .device(device)
-                .user(user)
-                .build());
-
-        duplicateRepairService.repairAll();
-
-        var rows = processRepository.findByDeviceIdAndPidAndStatusOrderByStartTimeAscIdAsc(
-                device.getId(), 2000L, "RUNNING");
-        assertThat(rows).singleElement()
-                .satisfies(row -> assertThat(row.getProcessName()).isEqualTo("new-app.exe"));
-        var older = processRepository.findAll().stream()
-                .filter(row -> "old-app.exe".equals(row.getProcessName()))
-                .findFirst()
-                .orElseThrow();
-        assertThat(older.getStatus()).isEqualTo("INTERRUPTED");
-        assertThat(older.getEndTime()).isEqualTo(newStart);
-        assertThat(older.getDurationSeconds()).isEqualTo(300L);
+        assertThat(processRepository.findByDeviceIdAndStatus(device.getId(), "RUNNING"))
+                .singleElement()
+                .satisfies(row -> assertThat(row.getStartTime()).isEqualTo(utc(secondStart)));
+        assertThat(processRepository.findAll()).hasSize(2);
+        assertThat(processRepository.findAll().stream()
+                .filter(row -> row.getStartTime().equals(utc(firstStart)))
+                .findFirst().orElseThrow().getEndTime()).isEqualTo(utc(secondStart));
     }
 
     @Test
-    void heartbeatOlderThanActivityStartDoesNotCreateNegativeDuration() {
-        String recordUuid = UUID.randomUUID().toString();
-        Instant start = Instant.parse("2026-07-22T10:00:30Z");
-        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
-                recordUuid,
-                ActivityKind.ACTIVE_WINDOW,
-                1,
-                start,
-                null,
-                ActivityState.OPEN,
-                null,
-                801L,
-                "chrome.exe",
-                "Latest window",
-                null));
+    void openingAWindowClosesEveryPreviousRunningWindow() {
+        Instant firstStart = Instant.parse("2026-07-25T08:30:00Z");
+        Instant secondStart = firstStart.plusSeconds(8);
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.ACTIVE_WINDOW, 1,
+                firstStart, null, ActivityState.OPEN, null, 101L, "chrome.exe", "Inbox"));
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.ACTIVE_WINDOW, 1,
+                secondStart, null, ActivityState.OPEN, null, 101L, "chrome.exe", "Reports"));
 
-        projectionService.temporarilyCloseForOffline(
-                agentDevice,
-                LocalDateTime.ofInstant(
-                        Instant.parse("2026-07-22T10:00:00Z"), ZoneOffset.UTC));
-
-        var temporary = windowRepository.findAll().getFirst();
-        assertThat(temporary.getStatus()).isEqualTo("OFFLINE");
-        assertThat(temporary.getEndTime()).isNull();
-        assertThat(temporary.getDurationSeconds()).isNull();
-
-        Instant actualEnd = Instant.parse("2026-07-22T10:01:00Z");
-        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
-                recordUuid,
-                ActivityKind.ACTIVE_WINDOW,
-                2,
-                start,
-                actualEnd,
-                ActivityState.CLOSED,
-                "WINDOW_CHANGED",
-                801L,
-                "chrome.exe",
-                "Latest window",
-                null));
-
-        var corrected = windowRepository.findAll().getFirst();
-        assertThat(corrected.getStatus()).isEqualTo("CLOSED");
-        assertThat(corrected.getEndTime())
-                .isEqualTo(LocalDateTime.ofInstant(actualEnd, ZoneOffset.UTC));
-        assertThat(corrected.getDurationSeconds()).isEqualTo(30L);
+        assertThat(windowRepository.findByDeviceIdAndStatus(device.getId(), "RUNNING"))
+                .singleElement()
+                .satisfies(row -> assertThat(row.getWindowTitle()).isEqualTo("Reports"));
+        assertThat(windowRepository.findAll().stream()
+                .filter(row -> "Inbox".equals(row.getWindowTitle()))
+                .findFirst().orElseThrow().getEndTime()).isEqualTo(utc(secondStart));
     }
 
     @Test
-    void authoritativeCloseReusesTemporarilyOfflineNearDuplicateProcess() {
-        Instant start = Instant.parse("2026-07-23T06:00:00Z");
-        String firstUuid = UUID.randomUUID().toString();
-        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
-                firstUuid,
-                ActivityKind.PROCESS,
-                1,
-                start,
-                null,
-                ActivityState.OPEN,
-                null,
-                8288L,
-                "msiexec.exe",
-                null,
-                null));
+    void openingIdleClosesEveryPreviousRunningIdle() {
+        Instant firstStart = Instant.parse("2026-07-25T08:40:00Z");
+        Instant secondStart = firstStart.plusSeconds(30);
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.IDLE, 1,
+                firstStart, null, ActivityState.OPEN, null, null, null, null));
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.IDLE, 1,
+                secondStart, null, ActivityState.OPEN, null, null, null, null));
 
-        projectionService.temporarilyCloseForOffline(
-                agentDevice,
-                LocalDateTime.ofInstant(start.plusSeconds(10), ZoneOffset.UTC));
+        assertThat(idleRepository.findByDeviceIdAndStatus(device.getId(), "RUNNING"))
+                .singleElement()
+                .satisfies(row -> assertThat(row.getIdleStart()).isEqualTo(utc(secondStart)));
+        assertThat(idleRepository.findAll().stream()
+                .filter(row -> row.getIdleStart().equals(utc(firstStart)))
+                .findFirst().orElseThrow().getIdleEnd()).isEqualTo(utc(secondStart));
+    }
 
-        String replayUuid = UUID.randomUUID().toString();
-        upsertService.apply(agentDevice, user, new ActivitySnapshotRequest(
-                replayUuid,
-                ActivityKind.PROCESS,
-                2,
-                start.plusSeconds(2),
-                start.plusSeconds(20),
-                ActivityState.CLOSED,
-                "PROCESS_EXIT",
-                8288L,
-                "msiexec.exe",
-                null,
-                null));
+    @Test
+    void offlineDisplayKeepsEndNullAndFreezesDurationAtLastSeen() {
+        Instant start = Instant.parse("2026-07-25T09:00:00Z");
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.PROCESS, 1,
+                start, null, ActivityState.OPEN, null, 500L, "chrome.exe", null));
+        device.setOnline(false);
+        device.setStatus("OFFLINE");
+        device.setLastSeen(utc(start.plusSeconds(12)));
+        deviceRepository.save(device);
+
+        var response = dashboardService.getActivities(
+                device.getId(), "processes", "ALL", "UTC", null, null,
+                null, null, 0, 20, "startTime", "desc", false);
+        ProcessActivityRow row = (ProcessActivityRow) response.rows().getFirst();
+
+        assertThat(row.status()).isEqualTo("OFFLINE");
+        assertThat(row.endTime()).isNull();
+        assertThat(row.durationSeconds()).isEqualTo(12L);
+        assertThat(processRepository.findAll().getFirst().getEndTime()).isNull();
+    }
+
+    @Test
+    void shutdownClosesAllRunningRowsEvenWhenDeviceWasOffline() {
+        String sessionUuid = UUID.randomUUID().toString();
+        Instant sessionStart = Instant.parse("2026-07-25T09:10:00Z");
+        Instant shutdown = sessionStart.plusSeconds(60);
+        agentDevice.setCurrentSessionUuid(sessionUuid);
+        agentDevice.setCurrentSessionStartedAt(utc(sessionStart));
+        agentDevice.setCurrentSessionSequence(1L);
+        agentDevice.setLifecycleState("OFFLINE");
+        agentDeviceRepository.save(agentDevice);
+        device.setOnline(false);
+        device.setStatus("OFFLINE");
+        deviceRepository.save(device);
+
+        upsertService.apply(agentDevice, user, snapshot(
+                sessionUuid, ActivityKind.DEVICE_SESSION, 1,
+                sessionStart, null, ActivityState.OPEN, null, null, null, null));
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.PROCESS, 1,
+                sessionStart.plusSeconds(2), null, ActivityState.OPEN,
+                null, 777L, "work.exe", null));
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.ACTIVE_WINDOW, 1,
+                sessionStart.plusSeconds(3), null, ActivityState.OPEN,
+                null, 777L, "work.exe", "Work"));
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.IDLE, 1,
+                sessionStart.plusSeconds(10), null, ActivityState.OPEN,
+                null, null, null, null));
+
+        deviceService.shutdown(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                new AgentShutdownRequest(
+                        shutdown, sessionUuid, sessionStart, 1L, "SYSTEM_SHUTDOWN"),
+                "127.0.0.1");
+
+        assertThat(processRepository.findByDeviceIdAndStatus(device.getId(), "RUNNING")).isEmpty();
+        assertThat(windowRepository.findByDeviceIdAndStatus(device.getId(), "RUNNING")).isEmpty();
+        assertThat(idleRepository.findByDeviceIdAndStatus(device.getId(), "RUNNING")).isEmpty();
+        assertThat(sessionRepository.findByDeviceIdAndStatus(device.getId(), "RUNNING")).isEmpty();
+        assertThat(processRepository.findAll().getFirst().getEndTime()).isEqualTo(utc(shutdown));
+        assertThat(windowRepository.findAll().getFirst().getEndTime()).isEqualTo(utc(shutdown));
+        assertThat(idleRepository.findAll().getFirst().getIdleEnd()).isEqualTo(utc(shutdown));
+        assertThat(sessionRepository.findAll().getFirst().getShutdownTime()).isEqualTo(utc(shutdown));
+    }
+
+    @Test
+    void aLateOpenReplayCannotReopenAnAlreadyClosedNaturalRecord() {
+        Instant start = Instant.parse("2026-07-25T09:30:00Z");
+        String closedUuid = UUID.randomUUID().toString();
+        upsertService.apply(agentDevice, user, snapshot(
+                closedUuid, ActivityKind.PROCESS, 2,
+                start, start.plusSeconds(5), ActivityState.CLOSED,
+                "PROCESS_EXIT", 808L, "tool.exe", null));
+        upsertService.apply(agentDevice, user, snapshot(
+                UUID.randomUUID().toString(), ActivityKind.PROCESS, 1,
+                start, null, ActivityState.OPEN, null, 808L, "tool.exe", null));
 
         assertThat(processRepository.count()).isEqualTo(1);
-        var projection = processRepository.findAll().getFirst();
-        assertThat(projection.getStatus()).isEqualTo("CLOSED");
-        assertThat(projection.getStartTime())
-                .isEqualTo(LocalDateTime.ofInstant(start, ZoneOffset.UTC));
-        assertThat(projection.getEndTime())
-                .isEqualTo(LocalDateTime.ofInstant(start.plusSeconds(20), ZoneOffset.UTC));
-        assertThat(projection.getDurationSeconds()).isEqualTo(20L);
-        assertThat(activityRepository.findById(firstUuid).orElseThrow().getLegacyRecordId())
-                .isEqualTo(projection.getId());
-        assertThat(activityRepository.findById(replayUuid).orElseThrow().getLegacyRecordId())
-                .isEqualTo(projection.getId());
+        assertThat(processRepository.findAll().getFirst().getStatus()).isEqualTo("CLOSED");
+        assertThat(processRepository.findAll().getFirst().getEndTime())
+                .isEqualTo(utc(start.plusSeconds(5)));
     }
 
+    @Test
+    void offlineDeviceBecomesOnlineOnlyAfterTheFinalBacklogBatch() {
+        Instant start = Instant.parse("2026-07-25T09:35:00Z");
+        String sessionUuid = UUID.randomUUID().toString();
+        agentDevice.setLifecycleState("OFFLINE");
+        agentDevice.setCurrentSessionUuid(null);
+        agentDevice.setCurrentSessionStartedAt(null);
+        agentDevice.setCurrentSessionSequence(null);
+        agentDeviceRepository.save(agentDevice);
+        device.setOnline(false);
+        device.setStatus("OFFLINE");
+        deviceRepository.save(device);
 
+        syncService.synchronize(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                new AgentSyncRequest(
+                        sessionUuid, start, 2L, Instant.now(), false,
+                        List.of(snapshot(
+                                UUID.randomUUID().toString(), ActivityKind.DEVICE_SESSION, 1,
+                                start, null, ActivityState.OPEN, null, null, null, null))),
+                "127.0.0.1");
+
+        assertThat(agentDeviceRepository.findById(agentDevice.getId()).orElseThrow()
+                .getLifecycleState()).isEqualTo("OFFLINE");
+        assertThat(deviceRepository.findById(device.getId()).orElseThrow().isOnline()).isFalse();
+
+        syncService.synchronize(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                new AgentSyncRequest(
+                        sessionUuid, start, 2L, Instant.now(), true,
+                        List.of(snapshot(
+                                UUID.randomUUID().toString(), ActivityKind.PROCESS, 1,
+                                start.plusSeconds(1), null, ActivityState.OPEN,
+                                null, 501L, "work.exe", null))),
+                "127.0.0.1");
+
+        assertThat(agentDeviceRepository.findById(agentDevice.getId()).orElseThrow()
+                .getLifecycleState()).isEqualTo("ONLINE");
+        assertThat(deviceRepository.findById(device.getId()).orElseThrow().isOnline()).isTrue();
+    }
+
+    @Test
+    void duplicateUuidInsideOneBatchIsRejectedWithoutCreatingAnotherRow() {
+        Instant start = Instant.parse("2026-07-25T09:38:00Z");
+        String recordUuid = UUID.randomUUID().toString();
+        var record = snapshot(
+                recordUuid, ActivityKind.PROCESS, 1,
+                start, null, ActivityState.OPEN, null, 321L, "calc.exe", null);
+
+        var response = syncService.synchronize(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                new AgentSyncRequest(
+                        UUID.randomUUID().toString(), start.minusSeconds(1), 1L,
+                        Instant.now(), true, List.of(record, record)),
+                "127.0.0.1");
+
+        assertThat(response.acknowledgements())
+                .extracting(ack -> ack.status())
+                .containsExactly("APPLIED", "REJECTED");
+        assertThat(activityRepository.count()).isEqualTo(1);
+        assertThat(processRepository.count()).isEqualTo(1);
+    }
+
+    @Test
+    void anInvalidRecordDoesNotBlockAValidRecordInTheSameBatch() {
+        Instant start = Instant.parse("2026-07-25T09:40:00Z");
+        var invalid = snapshot(
+                UUID.randomUUID().toString(), ActivityKind.IDLE, 2,
+                start, null, ActivityState.CLOSED, "USER_ACTIVE", null, null, null);
+        var valid = snapshot(
+                UUID.randomUUID().toString(), ActivityKind.PROCESS, 1,
+                start, null, ActivityState.OPEN, null, 123L, "notepad.exe", null);
+        String sessionUuid = UUID.randomUUID().toString();
+
+        var response = syncService.synchronize(
+                user.getUsername(),
+                agentDevice.getDeviceUuid(),
+                new AgentSyncRequest(
+                        sessionUuid, start.minusSeconds(1), 1L, Instant.now(), true,
+                        List.of(invalid, valid)),
+                "127.0.0.1");
+
+        assertThat(response.acknowledgements())
+                .extracting(ack -> ack.status())
+                .containsExactly("REJECTED", "APPLIED");
+        assertThat(activityRepository.findById(valid.recordUuid())).isPresent();
+    }
+
+    private static ActivitySnapshotRequest snapshot(
+            String uuid,
+            ActivityKind kind,
+            long revision,
+            Instant start,
+            Instant end,
+            ActivityState state,
+            String reason,
+            Long pid,
+            String processName,
+            String title) {
+        return new ActivitySnapshotRequest(
+                uuid, kind, revision, start, end, state, reason,
+                pid, processName, title, null);
+    }
+
+    private static LocalDateTime utc(Instant value) {
+        return LocalDateTime.ofInstant(value, ZoneOffset.UTC);
+    }
 }

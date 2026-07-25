@@ -52,6 +52,18 @@ public interface ProcessActivityRepository
 
     List<ProcessActivity> findByDeviceIdAndStatus(Long deviceId, String status);
 
+    Optional<ProcessActivity> findFirstByDeviceIdAndNaturalKeyOrderByIdDesc(
+            Long deviceId, String naturalKey);
+
+    Optional<ProcessActivity> findFirstByDeviceIdAndPidAndProcessNameIgnoreCaseAndStartTimeAndEndTimeIsNullOrderByIdDesc(
+            Long deviceId,
+            Long pid,
+            String processName,
+            LocalDateTime startTime);
+
+    Optional<ProcessActivity> findFirstByDeviceIdAndPidAndProcessNameIgnoreCaseAndStartTimeOrderByIdDesc(
+            Long deviceId, Long pid, String processName, LocalDateTime startTime);
+
     Optional<ProcessActivity> findFirstByDeviceIdAndPidAndStartTimeOrderByIdDesc(
             Long deviceId, Long pid, LocalDateTime startTime);
 

@@ -3,17 +3,17 @@ package com.tracker.server.agent.dto;
 import java.time.Instant;
 import java.util.List;
 
-import jakarta.validation.constraints.Min;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.Size;
 
 public record AgentSyncRequest(
-        @NotBlank @Size(max = 36) String sessionUuid,
+        @NotBlank String sessionUuid,
         @NotNull Instant sessionStartedAt,
-        @Min(1) long sessionSequence,
+        @Positive long sessionSequence,
         @NotNull Instant sentAt,
-        @NotEmpty @Size(max = 250) List<@Valid ActivitySnapshotRequest> records) {
+        boolean backlogCompleteAfterBatch,
+        @NotNull @Size(max = 250) List<@Valid ActivitySnapshotRequest> records) {
 }

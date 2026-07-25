@@ -30,6 +30,10 @@ public interface DeviceRepository
 
 	 List<Device> findByStatus(String status);
      List<Device> findByOnlineTrueAndLastSeenBefore(LocalDateTime cutoff);
+
+     long countByOnlineTrue();
+     long countByOnlineTrueAndLastSeenGreaterThanEqual(LocalDateTime cutoff);
+     long countByOnlineFalseAndStatusIgnoreCase(String status);
      List<Device> findByOnlineTrueAndLastSeenBeforeOrderByLastSeenAsc(
              LocalDateTime cutoff, Pageable pageable);
 	 

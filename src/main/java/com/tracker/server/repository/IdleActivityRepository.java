@@ -27,6 +27,12 @@ public interface IdleActivityRepository
 
     List<IdleActivity> findByDeviceIdAndStatus(Long deviceId, String status);
 
+    Optional<IdleActivity> findFirstByDeviceIdAndNaturalKeyOrderByIdDesc(
+            Long deviceId, String naturalKey);
+
+    Optional<IdleActivity> findFirstByDeviceIdAndIdleStartAndIdleEndIsNullOrderByIdDesc(
+            Long deviceId, LocalDateTime idleStart);
+
     Optional<IdleActivity> findFirstByDeviceIdAndStatusOrderByIdleStartDesc(
             Long deviceId, String status);
 

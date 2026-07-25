@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -59,6 +60,9 @@ public class AdminDashboardService {
     private final IdleActivityRepository idleRepository;
     private final DeviceSessionRepository sessionRepository;
 
+    @Value("${tracker.agent.offline-after-seconds:45}")
+    private long offlineAfterSeconds;
+
     public AdminDashboardService(
             UserRepository userRepository,
             DeviceRepository deviceRepository,
@@ -75,28 +79,14 @@ public class AdminDashboardService {
     }
 
     public AdminDashboardSummaryResponse getSummary() {
-        List<Device> devices = deviceRepository.findAll();
-        Map<Long, DeviceSession> latestSessions = latestSessionsByDevice();
-
-        long online = 0;
-        long offline = 0;
-        long shutdown = 0;
-
-        for (Device device : devices) {
-            String displayStatus = classifyDevice(device, latestSessions.get(device.getId()));
-            switch (displayStatus) {
-                case "ONLINE" -> online++;
-                case "SHUTDOWN" -> shutdown++;
-                default -> offline++;
-            }
-        }
-
-        long users = userRepository.findAll().stream()
-                .filter(this::isNormalUser)
-                .count();
+        long total = deviceRepository.count();
+        long online = deviceRepository.countByOnlineTrueAndLastSeenGreaterThanEqual(onlineCutoff());
+        long shutdown = deviceRepository.countByOnlineFalseAndStatusIgnoreCase("SHUTDOWN");
+        long offline = Math.max(0L, total - online - shutdown);
+        long users = userRepository.countByRoleIgnoreCase("USER");
 
         return new AdminDashboardSummaryResponse(
-                devices.size(), online, offline, shutdown, users);
+                total, online, offline, shutdown, users);
     }
 
     public List<AdminUserListItemResponse> getUsers(String search) {
@@ -157,7 +147,8 @@ public class AdminDashboardService {
         DateRange today = resolveDateRange("TODAY", timezone, null, null);
         long todayProcesses = processRepository.count(processSpec(
                 deviceId, null, null, today));
-        long runningProcesses = processRepository.countByDeviceIdAndStatus(deviceId, "RUNNING");
+        long runningProcesses = processRepository.count(processSpec(
+                deviceId, "RUNNING", null, new DateRange(null, null)));
 
         DeviceSession latestSession = sessionRepository.findTopByDeviceIdOrderByStartupTimeDesc(deviceId)
                 .orElse(null);
@@ -179,9 +170,9 @@ public class AdminDashboardService {
                 classifyDevice(device, latestSession),
                 todayProcesses,
                 runningProcesses,
-                toSessionSummary(latestSession),
-                toIdleSummary(currentIdle),
-                toWindowSummary(currentWindow));
+                toSessionSummary(latestSession, device),
+                toIdleSummary(currentIdle, device),
+                toWindowSummary(currentWindow, device));
     }
 
     public ActivityTableResponse<?> getActivities(
@@ -199,9 +190,9 @@ public class AdminDashboardService {
             String sortDir,
             boolean includeTotalDuration) {
 
-        if (!deviceRepository.existsById(deviceId)) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Device not found");
-        }
+        Device device = deviceRepository.findById(deviceId)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Device not found"));
 
         String normalizedType = normalizeType(type);
         String normalizedStatus = normalize(status);
@@ -216,21 +207,26 @@ public class AdminDashboardService {
                 ? Sort.Direction.ASC
                 : Sort.Direction.DESC;
 
+        String queryStatus = queryStatus(device, normalizedStatus);
+        if ("__NONE__".equals(queryStatus)) {
+            return emptyTable(normalizedType, safePage, safeSize);
+        }
+
         return switch (normalizedType) {
-            case "processes" -> processTable(deviceId, range, normalizedStatus, normalizedSearch,
+            case "processes" -> processTable(device, range, queryStatus, normalizedSearch,
                     safePage, safeSize, processSort(sortBy), direction, includeTotalDuration);
-            case "windows" -> windowTable(deviceId, range, normalizedStatus, normalizedSearch,
+            case "windows" -> windowTable(device, range, queryStatus, normalizedSearch,
                     safePage, safeSize, windowSort(sortBy), direction, includeTotalDuration);
-            case "idle" -> idleTable(deviceId, range, normalizedStatus,
+            case "idle" -> idleTable(device, range, queryStatus,
                     safePage, safeSize, idleSort(sortBy), direction, includeTotalDuration);
-            case "sessions" -> sessionTable(deviceId, range, normalizedStatus,
+            case "sessions" -> sessionTable(device, range, queryStatus,
                     safePage, safeSize, sessionSort(sortBy), direction, includeTotalDuration);
             default -> throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unsupported activity type");
         };
     }
 
     private ActivityTableResponse<ProcessActivityRow> processTable(
-            Long deviceId,
+            Device device,
             DateRange range,
             String status,
             String search,
@@ -240,6 +236,7 @@ public class AdminDashboardService {
             Sort.Direction direction,
             boolean includeTotalDuration) {
 
+        Long deviceId = device.getId();
         Specification<ProcessActivity> spec = processSpec(deviceId, status, search, range);
         Page<ProcessActivity> result = processRepository.findAll(
                 spec, PageRequest.of(page, size, Sort.by(direction, sortBy)));
@@ -250,7 +247,7 @@ public class AdminDashboardService {
 
         return new ActivityTableResponse<>(
                 "processes",
-                result.getContent().stream().map(this::toProcessRow).toList(),
+                result.getContent().stream().map(row -> toProcessRow(row, device)).toList(),
                 result.getTotalElements(),
                 result.getNumber(),
                 result.getSize(),
@@ -259,7 +256,7 @@ public class AdminDashboardService {
     }
 
     private ActivityTableResponse<ActiveWindowActivityRow> windowTable(
-            Long deviceId,
+            Device device,
             DateRange range,
             String status,
             String search,
@@ -269,6 +266,7 @@ public class AdminDashboardService {
             Sort.Direction direction,
             boolean includeTotalDuration) {
 
+        Long deviceId = device.getId();
         Specification<ActiveWindowActivity> spec = windowSpec(deviceId, status, search, range);
         Page<ActiveWindowActivity> result = windowRepository.findAll(
                 spec, PageRequest.of(page, size, Sort.by(direction, sortBy)));
@@ -279,7 +277,7 @@ public class AdminDashboardService {
 
         return new ActivityTableResponse<>(
                 "windows",
-                result.getContent().stream().map(this::toWindowRow).toList(),
+                result.getContent().stream().map(row -> toWindowRow(row, device)).toList(),
                 result.getTotalElements(),
                 result.getNumber(),
                 result.getSize(),
@@ -288,7 +286,7 @@ public class AdminDashboardService {
     }
 
     private ActivityTableResponse<IdleActivityRow> idleTable(
-            Long deviceId,
+            Device device,
             DateRange range,
             String status,
             int page,
@@ -297,6 +295,7 @@ public class AdminDashboardService {
             Sort.Direction direction,
             boolean includeTotalDuration) {
 
+        Long deviceId = device.getId();
         Specification<IdleActivity> spec = idleSpec(deviceId, status, range);
         Page<IdleActivity> result = idleRepository.findAll(
                 spec, PageRequest.of(page, size, Sort.by(direction, sortBy)));
@@ -307,7 +306,7 @@ public class AdminDashboardService {
 
         return new ActivityTableResponse<>(
                 "idle",
-                result.getContent().stream().map(this::toIdleRow).toList(),
+                result.getContent().stream().map(row -> toIdleRow(row, device)).toList(),
                 result.getTotalElements(),
                 result.getNumber(),
                 result.getSize(),
@@ -316,7 +315,7 @@ public class AdminDashboardService {
     }
 
     private ActivityTableResponse<DeviceSessionRow> sessionTable(
-            Long deviceId,
+            Device device,
             DateRange range,
             String status,
             int page,
@@ -325,6 +324,7 @@ public class AdminDashboardService {
             Sort.Direction direction,
             boolean includeTotalDuration) {
 
+        Long deviceId = device.getId();
         Specification<DeviceSession> spec = sessionSpec(deviceId, status, range);
         Page<DeviceSession> result = sessionRepository.findAll(
                 spec, PageRequest.of(page, size, Sort.by(direction, sortBy)));
@@ -335,7 +335,7 @@ public class AdminDashboardService {
 
         return new ActivityTableResponse<>(
                 "sessions",
-                result.getContent().stream().map(this::toSessionRow).toList(),
+                result.getContent().stream().map(row -> toSessionRow(row, device)).toList(),
                 result.getTotalElements(),
                 result.getNumber(),
                 result.getSize(),
@@ -347,14 +347,45 @@ public class AdminDashboardService {
             Long deviceId, String status, String search, DateRange range) {
         return (root, query, cb) -> {
             var predicates = new java.util.ArrayList<Predicate>();
-            predicates.add(cb.equal(root.get("device").get("id"), deviceId));
-            if (status != null) {
-                predicates.add(cb.equal(cb.upper(root.get("status")), status));
-            }
+            predicates.add(cb.equal(root.get("device").<Long>get("id"), deviceId));
+            addStatusPredicate(
+                    predicates, cb, root.<String>get("status"),
+                    root.<LocalDateTime>get("endTime"), status);
             if (search != null) {
-                predicates.add(cb.like(cb.lower(root.get("processName")), "%" + search + "%"));
+                predicates.add(cb.like(cb.lower(root.<String>get("processName")), "%" + search + "%"));
             }
-            addOverlapPredicates(predicates, cb, root.get("startTime"), root.get("endTime"), range);
+            addOverlapPredicates(predicates, cb, root.<LocalDateTime>get("startTime"), root.<LocalDateTime>get("endTime"), range);
+
+            var latest = query.subquery(Long.class);
+            var other = latest.from(ProcessActivity.class);
+            latest.select(cb.max(other.<Long>get("id")));
+            latest.where(
+                    cb.equal(other.get("device").<Long>get("id"), root.get("device").<Long>get("id")),
+                    sameNullable(cb, other.<Long>get("pid"), root.<Long>get("pid")),
+                    cb.equal(
+                            cb.lower(cb.coalesce(other.<String>get("processName"), "")),
+                            cb.lower(cb.coalesce(root.<String>get("processName"), ""))),
+                    sameNullable(cb, other.<LocalDateTime>get("startTime"), root.<LocalDateTime>get("startTime")));
+            predicates.add(cb.equal(root.<Long>get("id"), latest));
+
+            // Historical databases may already contain more than one open row for the
+            // same PID. The dashboard must still expose only the newest live process.
+            var latestOpen = query.subquery(Long.class);
+            var open = latestOpen.from(ProcessActivity.class);
+            latestOpen.select(cb.max(open.<Long>get("id")));
+            latestOpen.where(
+                    cb.equal(open.get("device").<Long>get("id"), deviceId),
+                    sameNullable(cb, open.<Long>get("pid"), root.<Long>get("pid")),
+                    effectiveOpenPredicate(
+                            cb,
+                            open.<String>get("status"),
+                            open.<LocalDateTime>get("endTime")));
+            predicates.add(cb.or(
+                    cb.not(effectiveOpenPredicate(
+                            cb,
+                            root.<String>get("status"),
+                            root.<LocalDateTime>get("endTime"))),
+                    cb.equal(root.<Long>get("id"), latestOpen)));
             return cb.and(predicates.toArray(Predicate[]::new));
         };
     }
@@ -363,14 +394,45 @@ public class AdminDashboardService {
             Long deviceId, String status, String search, DateRange range) {
         return (root, query, cb) -> {
             var predicates = new java.util.ArrayList<Predicate>();
-            predicates.add(cb.equal(root.get("device").get("id"), deviceId));
-            if (status != null) {
-                predicates.add(cb.equal(cb.upper(root.get("status")), status));
-            }
+            predicates.add(cb.equal(root.get("device").<Long>get("id"), deviceId));
+            addStatusPredicate(
+                    predicates, cb, root.<String>get("status"),
+                    root.<LocalDateTime>get("endTime"), status);
             if (search != null) {
-                predicates.add(cb.like(cb.lower(root.get("windowTitle")), "%" + search + "%"));
+                predicates.add(cb.like(cb.lower(root.<String>get("windowTitle")), "%" + search + "%"));
             }
-            addOverlapPredicates(predicates, cb, root.get("startTime"), root.get("endTime"), range);
+            addOverlapPredicates(predicates, cb, root.<LocalDateTime>get("startTime"), root.<LocalDateTime>get("endTime"), range);
+
+            var latestNatural = query.subquery(Long.class);
+            var other = latestNatural.from(ActiveWindowActivity.class);
+            latestNatural.select(cb.max(other.<Long>get("id")));
+            latestNatural.where(
+                    cb.equal(other.get("device").<Long>get("id"), root.get("device").<Long>get("id")),
+                    sameNullable(cb, other.<Long>get("pid"), root.<Long>get("pid")),
+                    cb.equal(
+                            cb.lower(cb.coalesce(other.<String>get("processName"), "")),
+                            cb.lower(cb.coalesce(root.<String>get("processName"), ""))),
+                    cb.equal(
+                            cb.coalesce(other.<String>get("windowTitle"), ""),
+                            cb.coalesce(root.<String>get("windowTitle"), "")),
+                    sameNullable(cb, other.<LocalDateTime>get("startTime"), root.<LocalDateTime>get("startTime")));
+            predicates.add(cb.equal(root.<Long>get("id"), latestNatural));
+
+            var latestOpen = query.subquery(Long.class);
+            var open = latestOpen.from(ActiveWindowActivity.class);
+            latestOpen.select(cb.max(open.<Long>get("id")));
+            latestOpen.where(
+                    cb.equal(open.get("device").<Long>get("id"), deviceId),
+                    effectiveOpenPredicate(
+                            cb,
+                            open.<String>get("status"),
+                            open.<LocalDateTime>get("endTime")));
+            predicates.add(cb.or(
+                    cb.not(effectiveOpenPredicate(
+                            cb,
+                            root.<String>get("status"),
+                            root.<LocalDateTime>get("endTime"))),
+                    cb.equal(root.<Long>get("id"), latestOpen)));
             return cb.and(predicates.toArray(Predicate[]::new));
         };
     }
@@ -378,11 +440,35 @@ public class AdminDashboardService {
     private Specification<IdleActivity> idleSpec(Long deviceId, String status, DateRange range) {
         return (root, query, cb) -> {
             var predicates = new java.util.ArrayList<Predicate>();
-            predicates.add(cb.equal(root.get("device").get("id"), deviceId));
-            if (status != null) {
-                predicates.add(cb.equal(cb.upper(root.get("status")), status));
-            }
-            addOverlapPredicates(predicates, cb, root.get("idleStart"), root.get("idleEnd"), range);
+            predicates.add(cb.equal(root.get("device").<Long>get("id"), deviceId));
+            addStatusPredicate(
+                    predicates, cb, root.<String>get("status"),
+                    root.<LocalDateTime>get("idleEnd"), status);
+            addOverlapPredicates(predicates, cb, root.<LocalDateTime>get("idleStart"), root.<LocalDateTime>get("idleEnd"), range);
+
+            var latestNatural = query.subquery(Long.class);
+            var other = latestNatural.from(IdleActivity.class);
+            latestNatural.select(cb.max(other.<Long>get("id")));
+            latestNatural.where(
+                    cb.equal(other.get("device").<Long>get("id"), root.get("device").<Long>get("id")),
+                    sameNullable(cb, other.<LocalDateTime>get("idleStart"), root.<LocalDateTime>get("idleStart")));
+            predicates.add(cb.equal(root.<Long>get("id"), latestNatural));
+
+            var latestOpen = query.subquery(Long.class);
+            var open = latestOpen.from(IdleActivity.class);
+            latestOpen.select(cb.max(open.<Long>get("id")));
+            latestOpen.where(
+                    cb.equal(open.get("device").<Long>get("id"), deviceId),
+                    effectiveOpenPredicate(
+                            cb,
+                            open.<String>get("status"),
+                            open.<LocalDateTime>get("idleEnd")));
+            predicates.add(cb.or(
+                    cb.not(effectiveOpenPredicate(
+                            cb,
+                            root.<String>get("status"),
+                            root.<LocalDateTime>get("idleEnd"))),
+                    cb.equal(root.<Long>get("id"), latestOpen)));
             return cb.and(predicates.toArray(Predicate[]::new));
         };
     }
@@ -390,13 +476,82 @@ public class AdminDashboardService {
     private Specification<DeviceSession> sessionSpec(Long deviceId, String status, DateRange range) {
         return (root, query, cb) -> {
             var predicates = new java.util.ArrayList<Predicate>();
-            predicates.add(cb.equal(root.get("device").get("id"), deviceId));
-            if (status != null) {
-                predicates.add(cb.equal(cb.upper(root.get("status")), status));
-            }
-            addOverlapPredicates(predicates, cb, root.get("startupTime"), root.get("shutdownTime"), range);
+            predicates.add(cb.equal(root.get("device").<Long>get("id"), deviceId));
+            addStatusPredicate(
+                    predicates, cb, root.<String>get("status"),
+                    root.<LocalDateTime>get("shutdownTime"), status);
+            addOverlapPredicates(predicates, cb, root.<LocalDateTime>get("startupTime"), root.<LocalDateTime>get("shutdownTime"), range);
+
+            var latestNatural = query.subquery(Long.class);
+            var other = latestNatural.from(DeviceSession.class);
+            latestNatural.select(cb.max(other.<Long>get("id")));
+            latestNatural.where(
+                    cb.equal(other.get("device").<Long>get("id"), root.get("device").<Long>get("id")),
+                    sameNullable(cb, other.<LocalDateTime>get("startupTime"), root.<LocalDateTime>get("startupTime")));
+            predicates.add(cb.equal(root.<Long>get("id"), latestNatural));
+
+            var latestOpen = query.subquery(Long.class);
+            var open = latestOpen.from(DeviceSession.class);
+            latestOpen.select(cb.max(open.<Long>get("id")));
+            latestOpen.where(
+                    cb.equal(open.get("device").<Long>get("id"), deviceId),
+                    effectiveOpenPredicate(
+                            cb,
+                            open.<String>get("status"),
+                            open.<LocalDateTime>get("shutdownTime")));
+            predicates.add(cb.or(
+                    cb.not(effectiveOpenPredicate(
+                            cb,
+                            root.<String>get("status"),
+                            root.<LocalDateTime>get("shutdownTime"))),
+                    cb.equal(root.<Long>get("id"), latestOpen)));
             return cb.and(predicates.toArray(Predicate[]::new));
         };
+    }
+
+    private void addStatusPredicate(
+            List<Predicate> predicates,
+            jakarta.persistence.criteria.CriteriaBuilder cb,
+            jakarta.persistence.criteria.Path<String> statusPath,
+            jakarta.persistence.criteria.Path<LocalDateTime> endPath,
+            String requestedStatus) {
+        if (requestedStatus == null) {
+            return;
+        }
+        var upper = cb.upper(statusPath);
+        if ("CLOSED".equals(requestedStatus)) {
+            predicates.add(cb.or(
+                    cb.equal(upper, "CLOSED"),
+                    cb.equal(upper, "INTERRUPTED"),
+                    cb.and(cb.equal(upper, "OFFLINE"), cb.isNotNull(endPath))));
+            return;
+        }
+        if ("RUNNING".equals(requestedStatus)) {
+            predicates.add(cb.or(
+                    cb.equal(upper, "RUNNING"),
+                    cb.and(cb.equal(upper, "OFFLINE"), cb.isNull(endPath))));
+            return;
+        }
+        predicates.add(cb.equal(upper, requestedStatus));
+    }
+
+    private Predicate effectiveOpenPredicate(
+            jakarta.persistence.criteria.CriteriaBuilder cb,
+            jakarta.persistence.criteria.Path<String> statusPath,
+            jakarta.persistence.criteria.Path<LocalDateTime> endPath) {
+        var upper = cb.upper(cb.coalesce(statusPath, ""));
+        return cb.or(
+                cb.equal(upper, "RUNNING"),
+                cb.and(cb.equal(upper, "OFFLINE"), cb.isNull(endPath)));
+    }
+
+    private Predicate sameNullable(
+            jakarta.persistence.criteria.CriteriaBuilder cb,
+            jakarta.persistence.criteria.Expression<?> first,
+            jakarta.persistence.criteria.Expression<?> second) {
+        return cb.or(
+                cb.equal(first, second),
+                cb.and(cb.isNull(first), cb.isNull(second)));
     }
 
     private void addOverlapPredicates(
@@ -483,17 +638,19 @@ public class AdminDashboardService {
                 device.getLastIpAddress(),
                 device.getLastSeen(),
                 classifyDevice(device, latestSession),
-                device.isOnline(),
+                isDeviceOnline(device),
                 latestSession == null ? null : latestSession.getStartupTime(),
                 latestSession == null ? null : latestSession.getShutdownTime(),
                 latestSession == null ? null : effectiveDuration(
+                        latestSession.getStatus(),
                         latestSession.getSessionDurationSeconds(),
                         latestSession.getStartupTime(),
-                        latestSession.getShutdownTime()));
+                        latestSession.getShutdownTime(),
+                        device));
     }
 
     private String classifyDevice(Device device, DeviceSession latestSession) {
-        if (device.isOnline()) {
+        if (isDeviceOnline(device)) {
             return "ONLINE";
         }
         String storedStatus = safe(device.getStatus()).toUpperCase(Locale.ROOT);
@@ -582,71 +739,211 @@ public class AdminDashboardService {
         return requested != null && allowed.contains(requested) ? requested : fallback;
     }
 
-    private ProcessActivityRow toProcessRow(ProcessActivity activity) {
+    private ProcessActivityRow toProcessRow(ProcessActivity activity, Device device) {
+        LocalDateTime displayEnd = effectiveEndTime(
+                activity.getStatus(), activity.getEndTime(), device);
         return new ProcessActivityRow(
-                activity.getId(), activity.getPid(), activity.getProcessName(), activity.getStatus(),
-                activity.getStartTime(), activity.getEndTime(),
-                effectiveDuration(activity.getDurationSeconds(), activity.getStartTime(), activity.getEndTime()));
+                activity.getId(),
+                activity.getPid(),
+                activity.getProcessName(),
+                effectiveActivityStatus(activity.getStatus(), activity.getEndTime(), device),
+                activity.getStartTime(),
+                displayEnd,
+                effectiveDuration(
+                        activity.getStatus(),
+                        activity.getDurationSeconds(),
+                        activity.getStartTime(),
+                        activity.getEndTime(),
+                        device));
     }
 
-    private ActiveWindowActivityRow toWindowRow(ActiveWindowActivity activity) {
+    private ActiveWindowActivityRow toWindowRow(
+            ActiveWindowActivity activity, Device device) {
+        LocalDateTime displayEnd = effectiveEndTime(
+                activity.getStatus(), activity.getEndTime(), device);
         return new ActiveWindowActivityRow(
-                activity.getId(), activity.getWindowTitle(), activity.getStatus(),
-                activity.getStartTime(), activity.getEndTime(),
-                effectiveDuration(activity.getDurationSeconds(), activity.getStartTime(), activity.getEndTime()));
+                activity.getId(),
+                activity.getWindowTitle(),
+                effectiveActivityStatus(activity.getStatus(), activity.getEndTime(), device),
+                activity.getStartTime(),
+                displayEnd,
+                effectiveDuration(
+                        activity.getStatus(),
+                        activity.getDurationSeconds(),
+                        activity.getStartTime(),
+                        activity.getEndTime(),
+                        device));
     }
 
-    private IdleActivityRow toIdleRow(IdleActivity activity) {
+    private IdleActivityRow toIdleRow(IdleActivity activity, Device device) {
+        LocalDateTime displayEnd = effectiveEndTime(
+                activity.getStatus(), activity.getIdleEnd(), device);
         return new IdleActivityRow(
-                activity.getId(), activity.getStatus(), activity.getIdleStart(), activity.getIdleEnd(),
-                effectiveDuration(activity.getIdleSeconds(), activity.getIdleStart(), activity.getIdleEnd()));
+                activity.getId(),
+                effectiveActivityStatus(activity.getStatus(), activity.getIdleEnd(), device),
+                activity.getIdleStart(),
+                displayEnd,
+                effectiveDuration(
+                        activity.getStatus(),
+                        activity.getIdleSeconds(),
+                        activity.getIdleStart(),
+                        activity.getIdleEnd(),
+                        device));
     }
 
-    private DeviceSessionRow toSessionRow(DeviceSession session) {
+    private DeviceSessionRow toSessionRow(DeviceSession session, Device device) {
+        LocalDateTime displayEnd = effectiveEndTime(
+                session.getStatus(), session.getShutdownTime(), device);
         return new DeviceSessionRow(
-                session.getId(), session.getStatus(), session.getStartupTime(), session.getShutdownTime(),
-                effectiveDuration(session.getSessionDurationSeconds(),
-                        session.getStartupTime(), session.getShutdownTime()));
+                session.getId(),
+                effectiveActivityStatus(session.getStatus(), session.getShutdownTime(), device),
+                session.getStartupTime(),
+                displayEnd,
+                effectiveDuration(
+                        session.getStatus(),
+                        session.getSessionDurationSeconds(),
+                        session.getStartupTime(),
+                        session.getShutdownTime(),
+                        device));
     }
 
-    private DeviceOverviewResponse.SessionSummary toSessionSummary(DeviceSession session) {
+    private DeviceOverviewResponse.SessionSummary toSessionSummary(
+            DeviceSession session, Device device) {
         if (session == null) {
             return null;
         }
         return new DeviceOverviewResponse.SessionSummary(
-                session.getId(), session.getStatus(), session.getStartupTime(), session.getShutdownTime(),
-                effectiveDuration(session.getSessionDurationSeconds(),
-                        session.getStartupTime(), session.getShutdownTime()));
+                session.getId(),
+                effectiveActivityStatus(session.getStatus(), session.getShutdownTime(), device),
+                session.getStartupTime(),
+                effectiveEndTime(session.getStatus(), session.getShutdownTime(), device),
+                effectiveDuration(
+                        session.getStatus(),
+                        session.getSessionDurationSeconds(),
+                        session.getStartupTime(),
+                        session.getShutdownTime(),
+                        device));
     }
 
-    private DeviceOverviewResponse.IdleSummary toIdleSummary(IdleActivity idle) {
+    private DeviceOverviewResponse.IdleSummary toIdleSummary(
+            IdleActivity idle, Device device) {
         if (idle == null) {
             return null;
         }
         return new DeviceOverviewResponse.IdleSummary(
-                idle.getId(), idle.getStatus(), idle.getIdleStart(), idle.getIdleEnd(),
-                effectiveDuration(idle.getIdleSeconds(), idle.getIdleStart(), idle.getIdleEnd()));
+                idle.getId(),
+                effectiveActivityStatus(idle.getStatus(), idle.getIdleEnd(), device),
+                idle.getIdleStart(),
+                effectiveEndTime(idle.getStatus(), idle.getIdleEnd(), device),
+                effectiveDuration(
+                        idle.getStatus(),
+                        idle.getIdleSeconds(),
+                        idle.getIdleStart(),
+                        idle.getIdleEnd(),
+                        device));
     }
 
-    private DeviceOverviewResponse.WindowSummary toWindowSummary(ActiveWindowActivity window) {
+    private DeviceOverviewResponse.WindowSummary toWindowSummary(
+            ActiveWindowActivity window, Device device) {
         if (window == null) {
             return null;
         }
         return new DeviceOverviewResponse.WindowSummary(
-                window.getId(), window.getWindowTitle(), window.getStatus(), window.getStartTime(),
-                window.getEndTime(), effectiveDuration(
-                        window.getDurationSeconds(), window.getStartTime(), window.getEndTime()));
+                window.getId(),
+                window.getWindowTitle(),
+                effectiveActivityStatus(window.getStatus(), window.getEndTime(), device),
+                window.getStartTime(),
+                effectiveEndTime(window.getStatus(), window.getEndTime(), device),
+                effectiveDuration(
+                        window.getStatus(),
+                        window.getDurationSeconds(),
+                        window.getStartTime(),
+                        window.getEndTime(),
+                        device));
     }
 
-    private long effectiveDuration(Long storedDuration, LocalDateTime start, LocalDateTime end) {
-        if (storedDuration != null && storedDuration >= 0) {
-            return storedDuration;
-        }
+    private long effectiveDuration(
+            String storedStatus,
+            Long storedDuration,
+            LocalDateTime start,
+            LocalDateTime end,
+            Device device) {
         if (start == null) {
             return 0;
         }
-        LocalDateTime effectiveEnd = end == null ? LocalDateTime.now(ZoneOffset.UTC) : end;
+        String status = effectiveActivityStatus(storedStatus, end, device);
+        LocalDateTime effectiveEnd;
+        if ("RUNNING".equals(status)) {
+            effectiveEnd = LocalDateTime.now(ZoneOffset.UTC);
+        } else if ("OFFLINE".equals(status)) {
+            effectiveEnd = device == null || device.getLastSeen() == null
+                    ? start
+                    : device.getLastSeen();
+        } else if (end != null) {
+            if (storedDuration != null && storedDuration >= 0) {
+                return storedDuration;
+            }
+            effectiveEnd = end;
+        } else {
+            return storedDuration == null ? 0 : Math.max(0, storedDuration);
+        }
+        if (effectiveEnd.isBefore(start)) {
+            effectiveEnd = start;
+        }
         return Math.max(0, Duration.between(start, effectiveEnd).getSeconds());
+    }
+
+    private LocalDateTime effectiveEndTime(
+            String storedStatus, LocalDateTime end, Device device) {
+        String status = effectiveActivityStatus(storedStatus, end, device);
+        return "RUNNING".equals(status) || "OFFLINE".equals(status) ? null : end;
+    }
+
+    private String effectiveActivityStatus(
+            String storedStatus, LocalDateTime end, Device device) {
+        String normalized = safe(storedStatus).toUpperCase(Locale.ROOT);
+        if ("INTERRUPTED".equals(normalized)) {
+            return "CLOSED";
+        }
+        if ("OFFLINE".equals(normalized)) {
+            if (device != null && !isDeviceOnline(device)) {
+                return "OFFLINE";
+            }
+            return end == null ? "RUNNING" : "CLOSED";
+        }
+        if ("RUNNING".equals(normalized) && device != null && !isDeviceOnline(device)) {
+            return "OFFLINE";
+        }
+        return normalized.isBlank() ? "CLOSED" : normalized;
+    }
+
+    private String queryStatus(Device device, String requestedStatus) {
+        if (requestedStatus == null) {
+            return null;
+        }
+        if ("OFFLINE".equals(requestedStatus)) {
+            return isDeviceOnline(device) ? "__NONE__" : "RUNNING";
+        }
+        if ("RUNNING".equals(requestedStatus) && !isDeviceOnline(device)) {
+            return "__NONE__";
+        }
+        return requestedStatus;
+    }
+
+    private boolean isDeviceOnline(Device device) {
+        if (device == null || !device.isOnline() || device.getLastSeen() == null) {
+            return false;
+        }
+        return !device.getLastSeen().isBefore(onlineCutoff());
+    }
+
+    private LocalDateTime onlineCutoff() {
+        return LocalDateTime.now(ZoneOffset.UTC)
+                .minusSeconds(Math.max(1L, offlineAfterSeconds));
+    }
+
+    private ActivityTableResponse<?> emptyTable(String type, int page, int size) {
+        return new ActivityTableResponse<>(type, List.of(), 0L, page, size, 0, 0L);
     }
 
 

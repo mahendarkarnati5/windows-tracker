@@ -29,6 +29,11 @@ public class ActiveWindowActivity {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    private Long pid;
+
+    @Column(length = 512)
+    private String processName;
+
     @Column(length = 1000)
     private String windowTitle;
 
@@ -42,6 +47,9 @@ public class ActiveWindowActivity {
     private Long durationSeconds;
 
     private String status;
+
+    @Column(name = "natural_key", length = 64)
+    private String naturalKey;
 
     @ManyToOne
     @JoinColumn(name = "device_id")
