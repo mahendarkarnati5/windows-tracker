@@ -3,6 +3,7 @@ package com.tracker.server.agent;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.UUID;
@@ -71,13 +72,30 @@ class AgentCredentialFilterIntegrationTest {
     void deviceCredentialAuthenticatesOnlyItsOwnAgentPath() throws Exception {
         String heartbeat = "/api/v1/agent/devices/"
                 + agentDevice.getDeviceUuid() + "/heartbeat";
+        Instant observedAt = Instant.now();
+        String heartbeatBody = """
+                {
+                  "observedAt": "%s",
+                  "sessionUuid": "%s",
+                  "sessionStartedAt": "%s",
+                  "sessionSequence": 1,
+                  "openRecordUuids": []
+                }
+                """.formatted(
+                        observedAt,
+                        UUID.randomUUID(),
+                        observedAt.minusSeconds(1));
 
         mockMvc.perform(post(heartbeat)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(heartbeatBody)
                         .header(AgentCredentialFilter.DEVICE_HEADER, agentDevice.getDeviceUuid())
                         .header(AgentCredentialFilter.TOKEN_HEADER, deviceToken))
                 .andExpect(status().isNoContent());
 
         mockMvc.perform(post(heartbeat)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(heartbeatBody)
                         .header(AgentCredentialFilter.DEVICE_HEADER, agentDevice.getDeviceUuid())
                         .header(AgentCredentialFilter.TOKEN_HEADER, "wrong"))
                 .andExpect(status().isUnauthorized());

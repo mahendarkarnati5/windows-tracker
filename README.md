@@ -1,4 +1,4 @@
-# Tracker Server 2.3.0
+# Tracker Server 2.3.1
 
 Spring Boot 3 / Java 21 / MySQL-compatible server for strict local-first agent synchronization.
 
@@ -11,7 +11,7 @@ Spring Boot 3 / Java 21 / MySQL-compatible server for strict local-first agent s
 ## Run
 
 ```bash
-java -jar target/tracker-backend-2.3.0.jar
+java -jar target/tracker-backend-2.3.1.jar
 ```
 
 Required environment:
