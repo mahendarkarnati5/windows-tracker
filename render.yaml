@@ -20,6 +20,10 @@ services:
         value: 10
       - key: DB_POOL_MIN_IDLE
         value: 1
+      - key: DB_CONNECT_RETRIES
+        value: 10
+      - key: DB_CONNECT_RETRY_INTERVAL
+        value: 5s
       - key: AGENT_OFFLINE_AFTER_SECONDS
         value: 45
       - key: AGENT_PRESENCE_CHECK_MS
